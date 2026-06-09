@@ -41,6 +41,7 @@ import {
   seedTickets,
 } from "../lib/auditData";
 import type {
+  ApiAuditJobResponse,
   ApiAuditResponse,
   AuditGrade,
   AuditRecord,
@@ -59,6 +60,8 @@ type ToastState = {
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_AUDIT_API_URL ?? "http://localhost:8000";
 const UNLIMITED_CREDITS = "∞";
+const JOB_POLL_INTERVAL_MS = 1500;
+const JOB_MAX_POLLS = 120;
 
 const navItems: Array<{
   key: ViewKey;
@@ -176,7 +179,9 @@ function CountsInline({ record }: { record: AuditRecord }) {
   );
 }
 
-async function requestAudit(recordInput: {
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+async function requestAuditDirect(recordInput: {
   url: string;
   managerName: string;
   advertiserName: string;
@@ -200,6 +205,57 @@ async function requestAudit(recordInput: {
 
   const body = (await response.json()) as ApiAuditResponse;
   return apiResponseToRecord(body);
+}
+
+async function requestAudit(recordInput: {
+  url: string;
+  managerName: string;
+  advertiserName: string;
+}, onProgress?: (progress: number, status: ApiAuditJobResponse["status"]) => void) {
+  const response = await fetch(`${API_BASE_URL}/api/audit-jobs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      url: recordInput.url,
+      user_id: "internal-platform",
+      manager_name: recordInput.managerName,
+      advertiser_name: recordInput.advertiserName,
+    }),
+  });
+
+  if (response.status === 404 || response.status === 405) {
+    onProgress?.(35, "running");
+    return requestAuditDirect(recordInput);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Audit job API failed: ${response.status}`);
+  }
+
+  let job = (await response.json()) as ApiAuditJobResponse;
+  onProgress?.(job.progress, job.status);
+
+  for (let attempt = 0; attempt < JOB_MAX_POLLS; attempt += 1) {
+    if (job.status === "completed" && job.result) {
+      onProgress?.(100, "completed");
+      return apiResponseToRecord(job.result);
+    }
+    if (job.status === "failed") {
+      throw new Error(job.error ?? "Audit job failed");
+    }
+
+    await wait(JOB_POLL_INTERVAL_MS);
+    const jobResponse = await fetch(`${API_BASE_URL}/api/audit-jobs/${job.job_id}`);
+    if (!jobResponse.ok) {
+      throw new Error(`Audit job polling failed: ${jobResponse.status}`);
+    }
+    job = (await jobResponse.json()) as ApiAuditJobResponse;
+    onProgress?.(job.progress, job.status);
+  }
+
+  throw new Error("Audit job timed out.");
 }
 
 function MetricCard({
@@ -234,6 +290,7 @@ export default function Home() {
   const [selectedUrlIds, setSelectedUrlIds] = useState<string[]>([]);
   const [detailRecord, setDetailRecord] = useState<AuditRecord>(seedRecords[0]);
   const [singleRunning, setSingleRunning] = useState(false);
+  const [singleProgress, setSingleProgress] = useState(0);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [pdfBanner, setPdfBanner] = useState<{
     status: "building" | "ready";
@@ -403,6 +460,7 @@ export default function Home() {
     }
 
     setSingleRunning(true);
+    setSingleProgress(5);
     showToast({
       tone: "info",
       title: "분석 큐 등록",
@@ -414,7 +472,7 @@ export default function Home() {
         url: normalized,
         managerName: singleForm.managerName,
         advertiserName: singleForm.advertiserName,
-      });
+      }, (progress) => setSingleProgress(progress));
       setRecords((current) => [nextRecord, ...current]);
       setManagedUrls((current) =>
         current.map((url) =>
@@ -459,6 +517,7 @@ export default function Home() {
       });
     } finally {
       setSingleRunning(false);
+      setSingleProgress(0);
     }
   }
 
@@ -474,7 +533,7 @@ export default function Home() {
     const queueSize = selectedManagedUrls.length;
     setBulkState({
       running: true,
-      progress: 22,
+      progress: 5,
       queued: queueSize,
       completed: 0,
       failed: 0,
@@ -494,7 +553,15 @@ export default function Home() {
             url: normalizeUrl(target.url),
             managerName: target.managerName,
             advertiserName: target.advertiserName,
-          }),
+          }, (progress) =>
+            setBulkState((current) => ({
+              ...current,
+              progress: Math.min(
+                99,
+                Math.round(((index + progress / 100) / queueSize) * 100),
+              ),
+            })),
+          ),
         );
       } catch {
         newRecords.push(
@@ -730,6 +797,14 @@ export default function Home() {
                   {singleRunning ? "분석 중" : "분석 시작"}
                 </button>
               </div>
+              {singleRunning ? (
+                <div className="analysis-progress" aria-label={`분석 진행률 ${singleProgress}%`}>
+                  <span>
+                    <i style={{ width: `${Math.max(singleProgress, 8)}%` }} />
+                  </span>
+                  <em>{singleProgress}%</em>
+                </div>
+              ) : null}
               <ul className="audit-notes">
                 <li>연결URL 입력 후 분석 시작 버튼 클릭 시 분석 큐에 등록됩니다.</li>
                 <li>동일한 랜딩페이지 기준 72시간 내 분석 결과를 재사용합니다.</li>
@@ -892,6 +967,16 @@ export default function Home() {
               <Box size={17} />
               {bulkState.running ? "진단 중" : "일괄 진단 시작"}
             </button>
+            {bulkState.running ? (
+              <div className="bulk-progress">
+                <span>
+                  <i style={{ width: `${bulkState.progress}%` }} />
+                </span>
+                <em>
+                  {bulkState.completed}/{bulkState.queued} 완료 · {bulkState.progress}%
+                </em>
+              </div>
+            ) : null}
           </section>
 
           <section className="bulk-url-card">

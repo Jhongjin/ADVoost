@@ -113,6 +113,18 @@ export interface ApiAuditResponse {
   duration_sec: number;
 }
 
+export type AuditJobStatus = "queued" | "running" | "completed" | "failed";
+
+export interface ApiAuditJobResponse {
+  job_id: string;
+  status: AuditJobStatus;
+  progress: number;
+  created_at: string;
+  updated_at: string;
+  result?: ApiAuditResponse | null;
+  error?: string | null;
+}
+
 export interface AuditRecord {
   id: string;
   url: string;

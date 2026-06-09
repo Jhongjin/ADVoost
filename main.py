@@ -8,10 +8,13 @@ import sqlite3
 import time
 import base64
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 from urllib.parse import urljoin, urlparse
+from uuid import uuid4
 
 import httpx
 from bs4 import BeautifulSoup
@@ -32,12 +35,14 @@ except Exception:  # Playwright is optional until the browser worker is installe
 Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
 Severity = Literal["critical", "major", "minor", "info"]
 Grade = Literal["A", "B", "C", "D", "F"]
+JobStatus = Literal["queued", "running", "completed", "failed"]
 
 DB_PATH = Path(__file__).with_name("advoost.sqlite3")
 CACHE_HOURS = 72
 USER_AGENT = "ADVoost-AuditBot/1.0 (+https://advoost.local)"
 BROWSER_AUDIT_ENABLED = os.getenv("ENABLE_BROWSER_AUDIT", "1") != "0"
 BROWSER_AUDIT_TIMEOUT_MS = int(os.getenv("BROWSER_AUDIT_TIMEOUT_MS", "15000"))
+AUDIT_WORKERS = int(os.getenv("AUDIT_WORKERS", "2"))
 DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -120,6 +125,16 @@ class AuditResponse(BaseModel):
     duration_sec: float
 
 
+class AuditJobResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    progress: int
+    created_at: str
+    updated_at: str
+    result: AuditResponse | None = None
+    error: str | None = None
+
+
 app = FastAPI(
     title="ADVoost SEO Audit Clone API",
     version="0.1.0",
@@ -151,6 +166,7 @@ def utcnow() -> datetime:
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -181,6 +197,10 @@ def init_db() -> None:
 
 
 init_db()
+
+AUDIT_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, AUDIT_WORKERS))
+AUDIT_JOBS: dict[str, AuditJobResponse] = {}
+AUDIT_JOBS_LOCK = Lock()
 
 
 def normalize_url(raw_url: str) -> str:
@@ -1403,8 +1423,7 @@ def history(user_id: str = "demo-user") -> list[AuditResponse]:
     return responses
 
 
-@app.post("/api/audit", response_model=AuditResponse)
-def audit(request: AuditRequest) -> AuditResponse:
+def run_audit(request: AuditRequest) -> AuditResponse:
     normalized_url = normalize_url(request.url)
     cached = load_cached(request.user_id, normalized_url)
     if cached:
@@ -1479,3 +1498,80 @@ def audit(request: AuditRequest) -> AuditResponse:
     )
     persist_response(response_payload)
     return response_payload
+
+
+def store_audit_job(job: AuditJobResponse) -> AuditJobResponse:
+    with AUDIT_JOBS_LOCK:
+        AUDIT_JOBS[job.job_id] = job
+        return job
+
+
+def update_audit_job(job_id: str, **fields: object) -> AuditJobResponse | None:
+    with AUDIT_JOBS_LOCK:
+        current = AUDIT_JOBS.get(job_id)
+        if current is None:
+            return None
+        next_job = current.model_copy(
+            update={
+                **fields,
+                "updated_at": utcnow().isoformat(),
+            }
+        )
+        AUDIT_JOBS[job_id] = next_job
+        return next_job
+
+
+def get_audit_job(job_id: str) -> AuditJobResponse | None:
+    with AUDIT_JOBS_LOCK:
+        return AUDIT_JOBS.get(job_id)
+
+
+def run_audit_job(job_id: str, request: AuditRequest) -> None:
+    update_audit_job(job_id, status="running", progress=18)
+    try:
+        result = run_audit(request)
+        update_audit_job(
+            job_id,
+            status="completed",
+            progress=100,
+            result=result,
+            error=None,
+        )
+    except Exception as exc:  # Keep failed jobs inspectable from the frontend.
+        update_audit_job(
+            job_id,
+            status="failed",
+            progress=100,
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+
+
+@app.post("/api/audit", response_model=AuditResponse)
+def audit(request: AuditRequest) -> AuditResponse:
+    return run_audit(request)
+
+
+@app.post("/api/audit-jobs", response_model=AuditJobResponse)
+def create_audit_job(request: AuditRequest) -> AuditJobResponse:
+    normalized_url = normalize_url(request.url)
+    queued_request = request.model_copy(update={"url": normalized_url})
+    created_at = utcnow().isoformat()
+    job_id = f"JOB-{utcnow().strftime('%y%m%d')}-{uuid4().hex[:8].upper()}"
+    job = AuditJobResponse(
+        job_id=job_id,
+        status="queued",
+        progress=5,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    store_audit_job(job)
+    AUDIT_EXECUTOR.submit(run_audit_job, job_id, queued_request)
+    return job
+
+
+@app.get("/api/audit-jobs/{job_id}", response_model=AuditJobResponse)
+def audit_job(job_id: str) -> AuditJobResponse:
+    job = get_audit_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Audit job not found.")
+    return job

@@ -1774,6 +1774,42 @@ textarea::placeholder {
   font-weight: 900;
 }
 
+.analysis-progress,
+.bulk-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  color: #536276;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.analysis-progress span,
+.bulk-progress span {
+  display: block;
+  overflow: hidden;
+  height: 6px;
+  border-radius: 999px;
+  background: #e8eff3;
+}
+
+.analysis-progress i,
+.bulk-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #06c98d;
+  transition: width 180ms ease;
+}
+
+.analysis-progress em,
+.bulk-progress em {
+  color: #536276;
+  font-style: normal;
+  white-space: nowrap;
+}
+
 .history-card {
   overflow: hidden;
 }
@@ -2011,6 +2047,7 @@ textarea::placeholder {
 .bulk-summary-card {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
   min-height: 120px;
   padding: 0 20px;
@@ -2027,6 +2064,10 @@ textarea::placeholder {
 
 .bulk-summary-card .primary-button {
   margin-left: auto;
+}
+
+.bulk-summary-card .bulk-progress {
+  flex-basis: 100%;
 }
 
 .bulk-url-card,
