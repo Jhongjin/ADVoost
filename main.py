@@ -11,6 +11,7 @@ import io
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from threading import Lock
@@ -40,14 +41,18 @@ try:
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
 except Exception:  # ReportLab is a server-side PDF fallback for restricted hosts.
     colors = None
     A4 = None
     mm = 1
     pdfmetrics = None
     UnicodeCIDFont = None
+    TTFont = None
     canvas = None
+    ImageReader = None
 
 
 Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
@@ -57,6 +62,9 @@ JobStatus = Literal["queued", "running", "completed", "failed"]
 ReportType = Literal["standard", "premium"]
 
 DB_PATH = Path(__file__).with_name("advoost.sqlite3")
+FONT_DIR = Path(__file__).parent / "assets" / "fonts"
+REPORT_FONT_REGULAR = FONT_DIR / "NanumGothic-Regular.ttf"
+REPORT_FONT_BOLD = FONT_DIR / "NanumGothic-Bold.ttf"
 CACHE_HOURS = 72
 USER_AGENT = "ADVoost-AuditBot/1.0 (+https://advoost.local)"
 BROWSER_AUDIT_ENABLED = os.getenv("ENABLE_BROWSER_AUDIT", "1") != "0"
@@ -1683,6 +1691,28 @@ def platform_guide(platform: str) -> list[tuple[str, str]]:
     return guides.get(platform, guides["자체개발"])
 
 
+@lru_cache(maxsize=1)
+def report_font_face_css() -> str:
+    if not REPORT_FONT_REGULAR.exists() or not REPORT_FONT_BOLD.exists():
+        return ""
+    regular = base64.b64encode(REPORT_FONT_REGULAR.read_bytes()).decode("ascii")
+    bold = base64.b64encode(REPORT_FONT_BOLD.read_bytes()).decode("ascii")
+    return f"""
+    @font-face {{
+      font-family: "ADVoostReport";
+      src: url("data:font/truetype;base64,{regular}") format("truetype");
+      font-weight: 400;
+      font-style: normal;
+    }}
+    @font-face {{
+      font-family: "ADVoostReport";
+      src: url("data:font/truetype;base64,{bold}") format("truetype");
+      font-weight: 700;
+      font-style: normal;
+    }}
+    """
+
+
 def keyword_table_html(record: dict, key: str, title: str) -> str:
     summary = record.get("keywordSummary") or {}
     rows = summary.get(key) or []
@@ -1804,13 +1834,14 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
 <head>
   <meta charset="utf-8" />
   <style>
+    {report_font_face_css()}
     @page {{ size: A4; margin: 17mm 15mm; }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       color: #06132a;
       background: #fff;
-      font-family: "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
+      font-family: "ADVoostReport", "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
       font-size: 13px;
       line-height: 1.65;
     }}
@@ -2025,12 +2056,17 @@ def render_report_pdfs_with_browser(
 
 
 def reportlab_is_available() -> bool:
-    return bool(canvas and colors and A4 and pdfmetrics and UnicodeCIDFont)
+    return bool(canvas and colors and A4 and pdfmetrics and UnicodeCIDFont and ImageReader)
 
 
+@lru_cache(maxsize=1)
 def ensure_reportlab_fonts() -> tuple[str, str]:
     if not reportlab_is_available():
         raise RuntimeError("ReportLab is not installed.")
+    if TTFont and REPORT_FONT_REGULAR.exists() and REPORT_FONT_BOLD.exists():
+        pdfmetrics.registerFont(TTFont("ADVoostReport", str(REPORT_FONT_REGULAR)))
+        pdfmetrics.registerFont(TTFont("ADVoostReport-Bold", str(REPORT_FONT_BOLD)))
+        return "ADVoostReport", "ADVoostReport-Bold"
     try:
         pdfmetrics.registerFont(UnicodeCIDFont(REPORTLAB_REGULAR_FONT))
         pdfmetrics.registerFont(UnicodeCIDFont(REPORTLAB_BOLD_FONT))
@@ -2065,6 +2101,17 @@ def wrap_pdf_text(text: object, font_name: str, font_size: int, max_width: float
         if current:
             wrapped.append(current.rstrip())
     return wrapped
+
+
+def image_reader_from_data_url(data_url: object):
+    source = report_text(data_url, "")
+    if not source.startswith("data:image/") or "," not in source:
+        return None
+    try:
+        payload = source.split(",", 1)[1]
+        return ImageReader(io.BytesIO(base64.b64decode(payload)))
+    except Exception:
+        return None
 
 
 class ReportLabPdf:
@@ -2146,6 +2193,40 @@ class ReportLabPdf:
         }
         fill, stroke, text_color = colors_by_status.get(status, colors_by_status["NOT_CHECKED"])
         self.badge(report_status_label(status), x, y, fill, stroke, text_color)
+
+    def draw_image_frame(
+        self,
+        data_url: object,
+        x: float,
+        top: float,
+        width: float,
+        height: float,
+        label: str,
+    ) -> None:
+        self.canvas.setFillColor(pdf_hex("#f6f8fb"))
+        self.canvas.setStrokeColor(pdf_hex("#cbd7e2"))
+        self.canvas.roundRect(x, top - height, width, height, 5, fill=1, stroke=1)
+        reader = image_reader_from_data_url(data_url)
+        if reader is None:
+            self.canvas.setFont(self.regular_font, 8)
+            self.canvas.setFillColor(pdf_hex("#7b8795"))
+            self.canvas.drawCentredString(x + width / 2, top - height / 2, f"{label} 캡처 없음")
+            return
+        self.canvas.saveState()
+        path = self.canvas.beginPath()
+        path.roundRect(x, top - height, width, height, 5)
+        self.canvas.clipPath(path, stroke=0, fill=0)
+        self.canvas.drawImage(
+            reader,
+            x,
+            top - height,
+            width=width,
+            height=height,
+            preserveAspectRatio=True,
+            anchor="n",
+            mask="auto",
+        )
+        self.canvas.restoreState()
 
     def header(self, premium: bool) -> None:
         self.canvas.setFont(self.bold_font, 15)
@@ -2261,6 +2342,7 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     grade = report_text(record.get("grade"), "C")
     score = report_text(record.get("score"), "0")
     created_at = report_text(record.get("createdAt"))
+    snapshot = record.get("renderSnapshot") or {}
     issue_count = counts["WARNING"] + counts["FAIL"]
 
     pdf.header(premium)
@@ -2271,9 +2353,10 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     pdf.y -= 8
     pdf.heading(f"{host} 결과 점검하기", 15)
 
-    center_x = pdf.margin_x + 95
-    center_y = pdf.y - 72
-    pdf.ensure_space(160)
+    overview_top = pdf.y
+    center_x = pdf.margin_x + 92
+    center_y = overview_top - 66
+    pdf.ensure_space(190)
     pdf.canvas.setFillColor(pdf_hex("#fff9e7"))
     pdf.canvas.setStrokeColor(pdf_hex("#f5b400"))
     pdf.canvas.setLineWidth(5)
@@ -2282,14 +2365,31 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     pdf.canvas.setFillColor(pdf_hex("#c65a00"))
     pdf.canvas.drawCentredString(center_x, center_y - 11, grade)
     pdf.canvas.setLineWidth(1)
-    pdf.y -= 138
+    pdf.draw_image_frame(
+        snapshot.get("desktopScreenshot"),
+        pdf.margin_x + 240,
+        overview_top - 2,
+        210,
+        118,
+        "데스크톱",
+    )
+    pdf.draw_image_frame(
+        snapshot.get("mobileScreenshot"),
+        pdf.margin_x + 462,
+        overview_top - 2,
+        58,
+        118,
+        "모바일",
+    )
+    pdf.y = overview_top - 142
     pdf.text(report_grade_message(grade), x=pdf.margin_x + 8, size=11, font=pdf.bold_font, max_width=190)
     pdf.text(f"개선 필요 항목: {issue_count}", x=pdf.margin_x + 8, size=9, color="#0057b8", max_width=190)
-    pdf.y += 56
-    pdf.text(f"URL: {url}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
-    pdf.text(f"분석일시: {created_at}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
-    pdf.text(f"점수: {score} / 등급: {grade}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
-    pdf.y -= 70
+    meta_y = overview_top - 136
+    pdf.y = meta_y
+    pdf.text(f"URL: {url}", x=pdf.margin_x + 240, size=8, color="#536276", max_width=pdf.content_width - 240)
+    pdf.text(f"분석일시: {created_at}", x=pdf.margin_x + 240, size=8, color="#536276", max_width=pdf.content_width - 240)
+    pdf.text(f"점수: {score} / 등급: {grade}", x=pdf.margin_x + 240, size=8, color="#536276", max_width=pdf.content_width - 240)
+    pdf.y = overview_top - 190
     pdf.count_cards(counts)
 
     if premium:
