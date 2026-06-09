@@ -94,6 +94,8 @@ const PDF_PLATFORMS: PdfPlatform[] = [
   "워드프레스",
   "자체개발",
 ];
+const HISTORY_MIN_ROWS = 21;
+const HISTORY_PAGE_SIZES = [10, 20, 50];
 
 const navItems: Array<{
   key: ViewKey;
@@ -367,6 +369,12 @@ export default function Home() {
   const [singleProgress, setSingleProgress] = useState(0);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<string[]>([]);
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyPageSize, setHistoryPageSize] = useState<number>(
+    HISTORY_PAGE_SIZES[0],
+  );
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPageSizeOpen, setHistoryPageSizeOpen] = useState(false);
   const [pdfJobs, setPdfJobs] = useState<PdfJob[]>([]);
   const [pdfDialog, setPdfDialog] = useState<PdfDialogState | null>(null);
   const [singleForm, setSingleForm] = useState({
@@ -426,15 +434,13 @@ export default function Home() {
     [managedUrls, selectedUrlIds],
   );
   const visibleManagedUrls = useMemo(() => managedUrls.slice(0, 19), [managedUrls]);
-  const historyRows = useMemo(() => {
-    const directRows = records.slice(0, 10);
-    if (directRows.length >= 10) {
-      return directRows;
-    }
+  const historySourceRows = useMemo(() => {
+    const directRows = records;
     const existing = new Set(directRows.map((record) => normalizeUrl(record.url)));
-    const fillers = visibleManagedUrls
+    const targetLength = Math.max(HISTORY_MIN_ROWS, directRows.length);
+    const fillers = managedUrls
       .filter((url) => !existing.has(normalizeUrl(url.url)))
-      .slice(0, 10 - directRows.length)
+      .slice(0, Math.max(0, targetLength - directRows.length))
       .map((url, index) => {
         const base = seedRecords[index % seedRecords.length];
         return {
@@ -448,15 +454,83 @@ export default function Home() {
         } satisfies AuditRecord;
       });
     return [...directRows, ...fillers];
-  }, [records, visibleManagedUrls]);
+  }, [records, managedUrls]);
+  const filteredHistoryRows = useMemo(() => {
+    const query = historySearch.trim().toLowerCase();
+    if (!query) {
+      return historySourceRows;
+    }
+
+    return historySourceRows.filter((record) => {
+      const counts = countItems(record.items);
+      return [
+        record.url,
+        getDisplayHost(record.url),
+        record.status,
+        record.grade,
+        record.managerName,
+        record.advertiserName,
+        formatHistoryDate(record.createdAt),
+        `${counts.PASS}/${counts.WARNING}/${counts.FAIL}`,
+      ].some((value) => value.toLowerCase().includes(query));
+    });
+  }, [historySearch, historySourceRows]);
+  const historyTotalPages = Math.max(
+    1,
+    Math.ceil(filteredHistoryRows.length / historyPageSize),
+  );
+  const historyCurrentPage = Math.min(historyPage, historyTotalPages);
+  const historyRows = useMemo(() => {
+    const start = (historyCurrentPage - 1) * historyPageSize;
+    return filteredHistoryRows.slice(start, start + historyPageSize);
+  }, [filteredHistoryRows, historyCurrentPage, historyPageSize]);
+  const historyPageNumbers = useMemo(() => {
+    const maxButtons = 5;
+    if (historyTotalPages <= maxButtons) {
+      return Array.from({ length: historyTotalPages }, (_, index) => index + 1);
+    }
+    const start = Math.max(
+      1,
+      Math.min(
+        historyCurrentPage - Math.floor(maxButtons / 2),
+        historyTotalPages - maxButtons + 1,
+      ),
+    );
+    return Array.from({ length: maxButtons }, (_, index) => start + index);
+  }, [historyCurrentPage, historyTotalPages]);
+  const historyStartIndex =
+    filteredHistoryRows.length > 0
+      ? (historyCurrentPage - 1) * historyPageSize + 1
+      : 0;
+  const historyEndIndex = Math.min(
+    historyCurrentPage * historyPageSize,
+    filteredHistoryRows.length,
+  );
   const selectedHistoryRows = useMemo(
-    () => historyRows.filter((record) => selectedHistoryIds.includes(record.id)),
-    [historyRows, selectedHistoryIds],
+    () =>
+      historySourceRows.filter((record) => selectedHistoryIds.includes(record.id)),
+    [historySourceRows, selectedHistoryIds],
   );
   const readyPdfJobs = useMemo(
     () => pdfJobs.filter((job) => job.status === "ready"),
     [pdfJobs],
   );
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historySearch, historyPageSize]);
+
+  useEffect(() => {
+    setHistoryPage((current) => Math.min(current, historyTotalPages));
+  }, [historyTotalPages]);
+
+  useEffect(() => {
+    const availableIds = new Set(historySourceRows.map((record) => record.id));
+    setSelectedHistoryIds((current) => {
+      const next = current.filter((id) => availableIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [historySourceRows]);
 
   function showToast(nextToast: ToastState) {
     setToast(nextToast);
@@ -612,8 +686,16 @@ export default function Home() {
 
   function toggleAllHistoryRows() {
     const rowIds = historyRows.map((record) => record.id);
+    if (rowIds.length === 0) {
+      return;
+    }
+    const rowIdSet = new Set(rowIds);
     const allSelected = rowIds.every((id) => selectedHistoryIds.includes(id));
-    setSelectedHistoryIds(allSelected ? [] : rowIds);
+    setSelectedHistoryIds((current) =>
+      allSelected
+        ? current.filter((id) => !rowIdSet.has(id))
+        : Array.from(new Set([...current, ...rowIds])),
+    );
   }
 
   function handleSupport(record: AuditRecord) {
@@ -1044,16 +1126,49 @@ export default function Home() {
 
           <section className="history-card">
             <div className="history-card-top">
-              <strong>전체 21건</strong>
+              <strong>
+                {historySearch.trim()
+                  ? `검색 ${filteredHistoryRows.length}건`
+                  : `전체 ${historySourceRows.length}건`}
+              </strong>
               <div className="history-tools">
                 <div className="search-field">
                   <Search size={16} />
-                  <input placeholder="검색" />
+                  <input
+                    value={historySearch}
+                    onChange={(event) => setHistorySearch(event.target.value)}
+                    placeholder="검색"
+                  />
                 </div>
                 <span className="rows-label">페이지당</span>
-                <button className="select-button" type="button">
-                  10개 <ChevronDown size={15} />
-                </button>
+                <div className="page-size-menu">
+                  <button
+                    className="select-button"
+                    type="button"
+                    aria-expanded={historyPageSizeOpen}
+                    onClick={() => setHistoryPageSizeOpen((current) => !current)}
+                  >
+                    {historyPageSize}개 <ChevronDown size={15} />
+                  </button>
+                  {historyPageSizeOpen ? (
+                    <div className="page-size-options" role="menu">
+                      {HISTORY_PAGE_SIZES.map((size) => (
+                        <button
+                          className={historyPageSize === size ? "active" : ""}
+                          type="button"
+                          role="menuitem"
+                          key={size}
+                          onClick={() => {
+                            setHistoryPageSize(size);
+                            setHistoryPageSizeOpen(false);
+                          }}
+                        >
+                          {size}개
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
             <div className="history-download-row">
@@ -1166,6 +1281,7 @@ export default function Home() {
                         selectedHistoryIds.includes(record.id),
                       )
                     }
+                    disabled={historyRows.length === 0}
                     onChange={toggleAllHistoryRows}
                   />
                 </span>
@@ -1178,50 +1294,86 @@ export default function Home() {
                 <span>광고주</span>
                 <span>액션</span>
               </div>
-              {historyRows.map((record, index) => (
-                <div className="history-table-row" key={`${record.id}-${index}`}>
-                  <span>
-                    <input
-                      type="checkbox"
-                      checked={selectedHistoryIds.includes(record.id)}
-                      onChange={() => toggleHistorySelection(record.id)}
-                    />
-                  </span>
-                  <span className="history-url-cell">
-                    <strong>{record.url}</strong>
-                    <ExternalLink size={14} />
-                  </span>
-                  <span>
-                    <StatusBadge status={record.status} />
-                  </span>
-                  <span>
-                    <GradeBadge grade={record.grade} />
-                  </span>
-                  <CountsInline record={record} />
-                  <span>{formatHistoryDate(record.createdAt)}</span>
-                  <span>{record.managerName}</span>
-                  <span>{record.advertiserName}</span>
-                  <span className="history-actions">
-                    <button type="button" onClick={() => openDetail(record)}>
-                      상세 보기
-                    </button>
-                    {record.grade === "F" ? (
-                      <button type="button" onClick={() => handleSupport(record)}>
-                        도와주세요
+              {historyRows.length > 0 ? (
+                historyRows.map((record, index) => (
+                  <div className="history-table-row" key={`${record.id}-${index}`}>
+                    <span>
+                      <input
+                        type="checkbox"
+                        checked={selectedHistoryIds.includes(record.id)}
+                        onChange={() => toggleHistorySelection(record.id)}
+                      />
+                    </span>
+                    <span className="history-url-cell">
+                      <strong>{record.url}</strong>
+                      <ExternalLink size={14} />
+                    </span>
+                    <span>
+                      <StatusBadge status={record.status} />
+                    </span>
+                    <span>
+                      <GradeBadge grade={record.grade} />
+                    </span>
+                    <CountsInline record={record} />
+                    <span>{formatHistoryDate(record.createdAt)}</span>
+                    <span>{record.managerName}</span>
+                    <span>{record.advertiserName}</span>
+                    <span className="history-actions">
+                      <button type="button" onClick={() => openDetail(record)}>
+                        상세 보기
                       </button>
-                    ) : null}
-                  </span>
-                </div>
-              ))}
+                      {record.grade === "F" ? (
+                        <button type="button" onClick={() => handleSupport(record)}>
+                          도와주세요
+                        </button>
+                      ) : null}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <div className="history-table-empty">검색 결과가 없습니다.</div>
+              )}
             </div>
             <div className="table-footer">
-              <span>전체 21개 중 1-10번째</span>
+              <span>
+                {filteredHistoryRows.length > 0
+                  ? `전체 ${filteredHistoryRows.length}개 중 ${historyStartIndex}-${historyEndIndex}번째`
+                  : `전체 ${historySourceRows.length}개 중 0번째`}
+              </span>
               <div className="pagination">
-                <ChevronRight className="prev" size={18} />
-                <strong>1</strong>
-                <span>2</span>
-                <span>3</span>
-                <ChevronRight size={18} />
+                <button
+                  type="button"
+                  aria-label="이전 페이지"
+                  disabled={historyCurrentPage <= 1}
+                  onClick={() =>
+                    setHistoryPage((current) => Math.max(1, current - 1))
+                  }
+                >
+                  <ChevronRight className="prev" size={18} />
+                </button>
+                {historyPageNumbers.map((page) => (
+                  <button
+                    className={historyCurrentPage === page ? "active" : ""}
+                    type="button"
+                    key={page}
+                    aria-current={historyCurrentPage === page ? "page" : undefined}
+                    onClick={() => setHistoryPage(page)}
+                  >
+                    {page}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  aria-label="다음 페이지"
+                  disabled={historyCurrentPage >= historyTotalPages}
+                  onClick={() =>
+                    setHistoryPage((current) =>
+                      Math.min(historyTotalPages, current + 1),
+                    )
+                  }
+                >
+                  <ChevronRight size={18} />
+                </button>
               </div>
             </div>
           </section>
@@ -1516,7 +1668,7 @@ export default function Home() {
               </button>
             </div>
             <div className="recent-list">
-              {historyRows.slice(0, 5).map((record) => (
+              {historySourceRows.slice(0, 5).map((record) => (
                 <button
                   className="recent-row"
                   key={record.id}

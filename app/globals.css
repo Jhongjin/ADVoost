@@ -1968,6 +1968,46 @@ textarea::placeholder {
   font-weight: 900;
 }
 
+.page-size-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.page-size-options {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  min-width: 92px;
+  overflow: hidden;
+  border: 1px solid #d7dee7;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 8px 18px rgba(15, 35, 52, 0.08);
+}
+
+.page-size-options button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-top: 1px solid #eef2f6;
+  color: #344054;
+  background: #fff;
+  font-weight: 800;
+  text-align: left;
+}
+
+.page-size-options button:first-child {
+  border-top: 0;
+}
+
+.page-size-options button:hover,
+.page-size-options button.active {
+  color: #0057b8;
+  background: #eef5ff;
+}
+
 .history-download-row {
   min-height: 58px;
   padding: 0 22px;
@@ -2169,6 +2209,17 @@ textarea::placeholder {
   overflow: visible;
 }
 
+.history-table-empty {
+  display: grid;
+  place-items: center;
+  min-width: 1008px;
+  min-height: 96px;
+  padding: 0 22px;
+  border-top: 1px solid #e5ebf0;
+  color: #7b8795;
+  font-weight: 800;
+}
+
 .complete-badge {
   display: inline-flex;
   align-items: center;
@@ -2226,19 +2277,28 @@ textarea::placeholder {
   color: #6b7280;
 }
 
+.pagination button,
 .pagination strong,
 .pagination span {
   display: inline-grid;
   place-items: center;
   width: 34px;
   height: 34px;
+  border: 0;
   border-radius: 8px;
+  color: #536276;
+  background: transparent;
   font-weight: 900;
 }
 
+.pagination button.active,
 .pagination strong {
   color: #fff;
   background: #0057b8;
+}
+
+.pagination button:disabled {
+  opacity: 0.38;
 }
 
 .pagination .prev {
