@@ -530,7 +530,15 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error(`PDF API failed: ${response.status}`);
+        let detail = "";
+        try {
+          const payload = (await response.clone().json()) as { detail?: unknown };
+          detail = typeof payload.detail === "string" ? payload.detail : "";
+        } catch {
+          detail = "";
+        }
+        const reason = detail ? ` (${detail})` : "";
+        throw new Error(`PDF 생성 실패: ${response.status}${reason}`);
       }
 
       const blob = await response.blob();

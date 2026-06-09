@@ -34,6 +34,21 @@ except Exception:  # Playwright is optional until the browser worker is installe
     PlaywrightTimeoutError = Exception
     sync_playwright = None
 
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+except Exception:  # ReportLab is a server-side PDF fallback for restricted hosts.
+    colors = None
+    A4 = None
+    mm = 1
+    pdfmetrics = None
+    UnicodeCIDFont = None
+    canvas = None
+
 
 Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
 Severity = Literal["critical", "major", "minor", "info"]
@@ -1963,37 +1978,387 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
 </html>"""
 
 
-def render_report_pdfs(records: list[dict], report_type: ReportType, platform: str) -> list[tuple[str, bytes]]:
-    if sync_playwright is None:
-        raise HTTPException(status_code=503, detail="Playwright is not installed.")
+REPORTLAB_REGULAR_FONT = "HYSMyeongJo-Medium"
+REPORTLAB_BOLD_FONT = "HYGothic-Medium"
+REPORTLAB_FALLBACK_REGULAR = "Helvetica"
+REPORTLAB_FALLBACK_BOLD = "Helvetica-Bold"
 
+
+def render_report_pdfs_with_browser(
+    records: list[dict],
+    report_type: ReportType,
+    platform: str,
+) -> list[tuple[str, bytes]]:
+    if sync_playwright is None:
+        raise RuntimeError("Playwright is not installed.")
     results: list[tuple[str, bytes]] = []
-    try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ],
+        )
+        try:
             for record in records:
                 page = browser.new_page(viewport={"width": 1240, "height": 1754})
-                page.set_content(
-                    build_report_html(record, report_type, platform),
-                    wait_until="load",
-                    timeout=20000,
-                )
-                pdf = page.pdf(
-                    format="A4",
-                    print_background=True,
-                    margin={"top": "14mm", "right": "12mm", "bottom": "14mm", "left": "12mm"},
-                )
-                page.close()
+                try:
+                    page.set_content(
+                        build_report_html(record, report_type, platform),
+                        wait_until="load",
+                        timeout=20000,
+                    )
+                    pdf = page.pdf(
+                        format="A4",
+                        print_background=True,
+                        margin={"top": "14mm", "right": "12mm", "bottom": "14mm", "left": "12mm"},
+                    )
+                finally:
+                    page.close()
                 results.append((report_filename(record, report_type), pdf))
+        finally:
             browser.close()
-    except PlaywrightError as exc:
-        raise HTTPException(status_code=503, detail=f"PDF renderer failed: {exc}") from exc
-
     return results
 
+
+def reportlab_is_available() -> bool:
+    return bool(canvas and colors and A4 and pdfmetrics and UnicodeCIDFont)
+
+
+def ensure_reportlab_fonts() -> tuple[str, str]:
+    if not reportlab_is_available():
+        raise RuntimeError("ReportLab is not installed.")
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont(REPORTLAB_REGULAR_FONT))
+        pdfmetrics.registerFont(UnicodeCIDFont(REPORTLAB_BOLD_FONT))
+        return REPORTLAB_REGULAR_FONT, REPORTLAB_BOLD_FONT
+    except Exception:
+        return REPORTLAB_FALLBACK_REGULAR, REPORTLAB_FALLBACK_BOLD
+
+
+def pdf_hex(value: str):
+    return colors.HexColor(value)
+
+
+def wrap_pdf_text(text: object, font_name: str, font_size: int, max_width: float) -> list[str]:
+    source = report_text(text, "")
+    if not source:
+        return []
+    paragraphs = source.splitlines() or [source]
+    wrapped: list[str] = []
+    for paragraph in paragraphs:
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        if not normalized:
+            wrapped.append("")
+            continue
+        current = ""
+        for char in normalized:
+            candidate = f"{current}{char}"
+            if current and pdfmetrics.stringWidth(candidate, font_name, font_size) > max_width:
+                wrapped.append(current.rstrip())
+                current = char.lstrip()
+            else:
+                current = candidate
+        if current:
+            wrapped.append(current.rstrip())
+    return wrapped
+
+
+class ReportLabPdf:
+    def __init__(self, title: str):
+        self.buffer = io.BytesIO()
+        self.width, self.height = A4
+        self.margin_x = 18 * mm
+        self.margin_top = 18 * mm
+        self.margin_bottom = 16 * mm
+        self.y = self.height - self.margin_top
+        self.regular_font, self.bold_font = ensure_reportlab_fonts()
+        self.canvas = canvas.Canvas(self.buffer, pagesize=A4)
+        self.canvas.setTitle(title)
+
+    @property
+    def content_width(self) -> float:
+        return self.width - (self.margin_x * 2)
+
+    def finish(self) -> bytes:
+        self.canvas.save()
+        return self.buffer.getvalue()
+
+    def ensure_space(self, needed: float) -> None:
+        if self.y - needed < self.margin_bottom:
+            self.canvas.showPage()
+            self.y = self.height - self.margin_top
+
+    def text(
+        self,
+        value: object,
+        *,
+        x: float | None = None,
+        size: int = 10,
+        font: str | None = None,
+        color: str = "#06132a",
+        leading: float | None = None,
+        max_width: float | None = None,
+    ) -> None:
+        font_name = font or self.regular_font
+        line_height = leading or (size + 5)
+        x_pos = self.margin_x if x is None else x
+        width = max_width or (self.width - self.margin_x - x_pos)
+        lines = wrap_pdf_text(value, font_name, size, width)
+        self.ensure_space(max(line_height * max(len(lines), 1), line_height))
+        self.canvas.setFont(font_name, size)
+        self.canvas.setFillColor(pdf_hex(color))
+        for line in lines:
+            self.canvas.drawString(x_pos, self.y, line)
+            self.y -= line_height
+
+    def heading(self, value: str, size: int = 18) -> None:
+        self.ensure_space(size + 18)
+        self.canvas.setFont(self.bold_font, size)
+        self.canvas.setFillColor(pdf_hex("#06132a"))
+        self.canvas.drawString(self.margin_x, self.y, value)
+        self.y -= size + 12
+
+    def divider(self, gap: float = 10) -> None:
+        self.ensure_space(gap + 2)
+        self.y -= gap / 2
+        self.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+        self.canvas.line(self.margin_x, self.y, self.width - self.margin_x, self.y)
+        self.y -= gap
+
+    def badge(self, value: str, x: float, y: float, fill: str, stroke: str, color: str) -> None:
+        self.canvas.setFillColor(pdf_hex(fill))
+        self.canvas.setStrokeColor(pdf_hex(stroke))
+        self.canvas.roundRect(x, y - 4, 42, 18, 7, fill=1, stroke=1)
+        self.canvas.setFont(self.bold_font, 9)
+        self.canvas.setFillColor(pdf_hex(color))
+        self.canvas.drawCentredString(x + 21, y + 1, value)
+
+    def status_badge(self, status: str, x: float, y: float) -> None:
+        colors_by_status = {
+            "PASS": ("#e8fbf1", "#b7efcf", "#00945f"),
+            "WARNING": ("#fff5de", "#ffd58a", "#c65a00"),
+            "FAIL": ("#ffe9ee", "#ffb9c8", "#d20b3f"),
+            "NOT_CHECKED": ("#edf2f7", "#dbe3eb", "#536276"),
+        }
+        fill, stroke, text_color = colors_by_status.get(status, colors_by_status["NOT_CHECKED"])
+        self.badge(report_status_label(status), x, y, fill, stroke, text_color)
+
+    def header(self, premium: bool) -> None:
+        self.canvas.setFont(self.bold_font, 15)
+        self.canvas.setFillColor(pdf_hex("#3346a3"))
+        self.canvas.drawString(self.margin_x, self.y, "ADVoost")
+        self.canvas.setFillColor(pdf_hex("#06132a"))
+        self.canvas.drawString(self.margin_x + 68, self.y, "검색 × SEO.co.kr")
+        self.canvas.setFont(self.regular_font, 9)
+        self.canvas.setFillColor(pdf_hex("#6b7685"))
+        label = "프리미엄 웹사이트 분석 리포트" if premium else "웹사이트 분석 리포트"
+        self.canvas.drawRightString(self.width - self.margin_x, self.y, label)
+        self.y -= 18
+        self.divider(10)
+
+    def count_cards(self, counts: dict[str, int]) -> None:
+        card_gap = 6
+        card_width = (self.content_width - card_gap * 3) / 4
+        card_height = 46
+        labels = [
+            ("PASS", "통과", "#e9fbf1", "#00a965"),
+            ("WARNING", "경고", "#fff7df", "#d87600"),
+            ("FAIL", "실패", "#ffecee", "#e40046"),
+            ("NOT_CHECKED", "수집불가", "#fff0f5", "#a50041"),
+        ]
+        self.ensure_space(card_height + 16)
+        top = self.y
+        for index, (key, label, fill, color) in enumerate(labels):
+            x = self.margin_x + index * (card_width + card_gap)
+            self.canvas.setFillColor(pdf_hex(fill))
+            self.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+            self.canvas.roundRect(x, top - card_height, card_width, card_height, 5, fill=1, stroke=1)
+            self.canvas.setFont(self.bold_font, 16)
+            self.canvas.setFillColor(pdf_hex(color))
+            self.canvas.drawCentredString(x + card_width / 2, top - 22, str(counts[key]))
+            self.canvas.setFont(self.regular_font, 8)
+            self.canvas.drawCentredString(x + card_width / 2, top - 35, label)
+        self.y -= card_height + 18
+
+    def item_block(self, item: dict, premium: bool) -> None:
+        status = report_text(item.get("status"), "NOT_CHECKED")
+        name = report_text(item.get("itemName"))
+        category = report_text(item.get("category"))
+        detected = report_text(item.get("detectedValue") or item.get("description"))
+        guide = report_text(item.get("remediation") or item.get("guide") or item.get("description"))
+        snippet = report_text(item.get("snippet"), "")
+        self.ensure_space(70)
+        block_top = self.y
+        self.canvas.setStrokeColor(pdf_hex("#e2e8f0"))
+        self.canvas.line(self.margin_x, block_top + 7, self.width - self.margin_x, block_top + 7)
+        self.status_badge(status, self.margin_x, block_top - 10)
+        self.canvas.setFont(self.bold_font, 10)
+        self.canvas.setFillColor(pdf_hex("#06132a"))
+        self.canvas.drawString(self.margin_x + 54, block_top - 5, name[:70])
+        self.canvas.setFont(self.regular_font, 8)
+        self.canvas.setFillColor(pdf_hex("#6b7685"))
+        self.canvas.drawRightString(self.width - self.margin_x, block_top - 5, category)
+        self.y -= 28
+        self.text(f"감지값: {detected}", x=self.margin_x + 54, size=8, color="#536276", max_width=self.content_width - 54)
+        self.text(f"개선 방안: {guide}", x=self.margin_x + 54, size=8, color="#536276", max_width=self.content_width - 54)
+        if premium and snippet:
+            snippet_text = snippet[:1800] + ("..." if len(snippet) > 1800 else "")
+            self.ensure_space(42)
+            self.canvas.setFillColor(pdf_hex("#edf3f7"))
+            snippet_height = min(90, max(42, len(wrap_pdf_text(snippet_text, self.regular_font, 7, self.content_width - 64)) * 10 + 14))
+            self.canvas.roundRect(self.margin_x + 54, self.y - snippet_height + 7, self.content_width - 54, snippet_height, 5, fill=1, stroke=0)
+            self.text(snippet_text, x=self.margin_x + 62, size=7, color="#536276", leading=9, max_width=self.content_width - 70)
+        self.y -= 8
+
+
+def draw_keyword_rows(pdf: ReportLabPdf, rows: list[dict], title: str) -> None:
+    pdf.heading(title, 13)
+    if not rows:
+        pdf.text("키워드 데이터가 없습니다.", size=9, color="#6b7685")
+        return
+    header_y = pdf.y
+    pdf.canvas.setFillColor(pdf_hex("#f4f7fa"))
+    pdf.canvas.roundRect(pdf.margin_x, header_y - 18, pdf.content_width, 22, 4, fill=1, stroke=0)
+    pdf.canvas.setFont(pdf.bold_font, 8)
+    pdf.canvas.setFillColor(pdf_hex("#536276"))
+    columns = [0, 34, 250, 310, 380, 455]
+    labels = ["#", "키워드", "빈도수", "비율", "타이틀", "설명"]
+    for offset, label in zip(columns, labels):
+        pdf.canvas.drawString(pdf.margin_x + offset, header_y - 9, label)
+    pdf.y -= 26
+    for index, row in enumerate(rows[:30], start=1):
+        pdf.ensure_space(22)
+        y = pdf.y
+        pdf.canvas.setStrokeColor(pdf_hex("#e2e8f0"))
+        pdf.canvas.line(pdf.margin_x, y + 7, pdf.width - pdf.margin_x, y + 7)
+        pdf.canvas.setFont(pdf.regular_font, 8)
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        values = [
+            str(index),
+            report_text(row.get("keyword")),
+            report_text(row.get("frequency")),
+            report_text(row.get("ratio")),
+            "통과" if row.get("titleOk") else "미포함",
+            "통과" if row.get("descOk") else "미포함",
+        ]
+        for offset, value in zip(columns, values):
+            pdf.canvas.drawString(pdf.margin_x + offset, y - 6, value[:24])
+        pdf.y -= 18
+    pdf.y -= 6
+
+
+def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, platform: str) -> bytes:
+    premium = report_type == "premium"
+    title = f"{'프리미엄 ' if premium else ''}진단보고서 - {report_host(report_text(record.get('url')))}"
+    pdf = ReportLabPdf(title)
+    counts = report_status_counts(record)
+    url = report_text(record.get("url"))
+    host = report_host(url)
+    grade = report_text(record.get("grade"), "C")
+    score = report_text(record.get("score"), "0")
+    created_at = report_text(record.get("createdAt"))
+    issue_count = counts["WARNING"] + counts["FAIL"]
+
+    pdf.header(premium)
+    pdf.heading("진단보고서", 22)
+    pdf.text("이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다.", size=10, color="#536276")
+    pdf.text("수집 실패, 색인 실패, SEO 점검 필요 여부를 심층 진단하여 A에서 F까지의 등급을 제공합니다.", size=10, color="#536276")
+    pdf.text("진단 도구는 웹사이트에 대한 전반적인 점검 결과를 제공하며 검색 광고 노출을 보장하지는 않습니다.", size=10, font=pdf.bold_font, color="#f00000")
+    pdf.y -= 8
+    pdf.heading(f"{host} 결과 점검하기", 15)
+
+    center_x = pdf.margin_x + 95
+    center_y = pdf.y - 72
+    pdf.ensure_space(160)
+    pdf.canvas.setFillColor(pdf_hex("#fff9e7"))
+    pdf.canvas.setStrokeColor(pdf_hex("#f5b400"))
+    pdf.canvas.setLineWidth(5)
+    pdf.canvas.circle(center_x, center_y, 58, stroke=1, fill=1)
+    pdf.canvas.setFont(pdf.bold_font, 34)
+    pdf.canvas.setFillColor(pdf_hex("#c65a00"))
+    pdf.canvas.drawCentredString(center_x, center_y - 11, grade)
+    pdf.canvas.setLineWidth(1)
+    pdf.y -= 138
+    pdf.text(report_grade_message(grade), x=pdf.margin_x + 8, size=11, font=pdf.bold_font, max_width=190)
+    pdf.text(f"개선 필요 항목: {issue_count}", x=pdf.margin_x + 8, size=9, color="#0057b8", max_width=190)
+    pdf.y += 56
+    pdf.text(f"URL: {url}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
+    pdf.text(f"분석일시: {created_at}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
+    pdf.text(f"점수: {score} / 등급: {grade}", x=pdf.margin_x + 240, size=9, color="#536276", max_width=pdf.content_width - 240)
+    pdf.y -= 70
+    pdf.count_cards(counts)
+
+    if premium:
+        pdf.canvas.showPage()
+        pdf.y = pdf.height - pdf.margin_top
+        pdf.header(premium)
+        pdf.heading("프리미엄 플랫폼 수정 가이드", 17)
+        pdf.text(f"선택 플랫폼: {platform}", size=10, font=pdf.bold_font)
+        for guide_title, copy in platform_guide(platform):
+            pdf.ensure_space(42)
+            pdf.canvas.setFillColor(pdf_hex("#f8fbfd"))
+            pdf.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+            pdf.canvas.roundRect(pdf.margin_x, pdf.y - 36, pdf.content_width, 40, 5, fill=1, stroke=1)
+            pdf.text(guide_title, x=pdf.margin_x + 10, size=9, font=pdf.bold_font, max_width=pdf.content_width - 20)
+            pdf.text(copy, x=pdf.margin_x + 10, size=8, color="#536276", max_width=pdf.content_width - 20)
+            pdf.y -= 8
+
+        summary = record.get("keywordSummary") or {}
+        pdf.canvas.showPage()
+        pdf.y = pdf.height - pdf.margin_top
+        pdf.header(premium)
+        pdf.heading("키워드 요약", 17)
+        draw_keyword_rows(pdf, summary.get("singleRows") or [], "개별 키워드")
+        draw_keyword_rows(pdf, summary.get("phraseRows") or [], "프레이즈 키워드")
+        items = record.get("items", [])
+    else:
+        items = [item for item in record.get("items", []) if report_text(item.get("status")) != "PASS"]
+
+    pdf.canvas.showPage()
+    pdf.y = pdf.height - pdf.margin_top
+    pdf.header(premium)
+    pdf.heading("점검 세부 내역" if premium else "개선 필요 항목", 17)
+    if not items:
+        pdf.text("개선이 필요한 항목이 없습니다.", size=10, color="#536276")
+    for item in items:
+        pdf.item_block(item, premium=premium)
+
+    return pdf.finish()
+
+
+def render_report_pdfs_with_reportlab(
+    records: list[dict],
+    report_type: ReportType,
+    platform: str,
+) -> list[tuple[str, bytes]]:
+    if not reportlab_is_available():
+        raise RuntimeError("ReportLab is not installed.")
+    return [
+        (report_filename(record, report_type), render_report_pdf_with_reportlab(record, report_type, platform))
+        for record in records
+    ]
+
+
+def render_report_pdfs(records: list[dict], report_type: ReportType, platform: str) -> list[tuple[str, bytes]]:
+    browser_error: Exception | None = None
+    if sync_playwright is not None:
+        try:
+            return render_report_pdfs_with_browser(records, report_type, platform)
+        except Exception as exc:
+            browser_error = exc
+
+    try:
+        return render_report_pdfs_with_reportlab(records, report_type, platform)
+    except Exception as fallback_error:
+        detail = "PDF renderer failed."
+        if browser_error is not None:
+            detail += f" Browser: {browser_error.__class__.__name__}: {browser_error}"
+        detail += f" Fallback: {fallback_error.__class__.__name__}: {fallback_error}"
+        raise HTTPException(status_code=503, detail=detail) from fallback_error
 
 def disposition(filename: str) -> str:
     return f"attachment; filename*=UTF-8''{quote(filename)}"
