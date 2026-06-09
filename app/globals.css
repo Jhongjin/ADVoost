@@ -2535,6 +2535,16 @@ textarea::placeholder {
   border-radius: 8px 8px 2px 2px;
   background: #fff;
   box-shadow: 0 6px 16px rgba(20, 31, 46, 0.12);
+  overflow: hidden;
+}
+
+.desktop-device img {
+  display: block;
+  width: calc(100% + 36px);
+  height: 128px;
+  margin: -20px -18px -10px;
+  object-fit: cover;
+  object-position: top center;
 }
 
 .device-top-dots {
@@ -2581,6 +2591,16 @@ textarea::placeholder {
   border: 6px solid #d5dfe8;
   border-radius: 24px;
   background: #fff;
+  overflow: hidden;
+}
+
+.mobile-device img {
+  display: block;
+  width: calc(100% + 20px);
+  height: 112px;
+  margin: -12px -10px -6px;
+  object-fit: cover;
+  object-position: top center;
 }
 
 .mobile-device div {

@@ -322,6 +322,7 @@ export default function ReportDetail({
     (item) => item.category === "수집" && item.status === "FAIL",
   );
   const reportHost = getReportHost(record.url);
+  const renderSnapshot = record.renderSnapshot;
   const keywordSummary = record.keywordSummary ?? fallbackKeywordSummary;
   const activeKeywordRows =
     keywordMode === "single"
@@ -450,19 +451,31 @@ export default function ReportDetail({
           <div className="device-report">
             <div className="device-preview-row">
               <div className="desktop-device">
-                <div className="device-top-dots" />
-                <div className="mock-hero" />
-                <div className="mock-grid">
-                  <span />
-                  <span />
-                  <span />
-                </div>
+                {renderSnapshot?.desktopScreenshot ? (
+                  <img src={renderSnapshot.desktopScreenshot} alt="데스크톱 캡처" />
+                ) : (
+                  <>
+                    <div className="device-top-dots" />
+                    <div className="mock-hero" />
+                    <div className="mock-grid">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </>
+                )}
               </div>
               <div className="mobile-device">
-                <div />
-                <span />
-                <span />
-                <span />
+                {renderSnapshot?.mobileScreenshot ? (
+                  <img src={renderSnapshot.mobileScreenshot} alt="모바일 캡처" />
+                ) : (
+                  <>
+                    <div />
+                    <span />
+                    <span />
+                    <span />
+                  </>
+                )}
               </div>
             </div>
             <div className="device-labels">
@@ -475,6 +488,13 @@ export default function ReportDetail({
                 모바일
               </span>
             </div>
+            {renderSnapshot?.success && renderSnapshot.loadTimeMs ? (
+              <p>
+                렌더링 {renderSnapshot.loadTimeMs} ms · 리소스{" "}
+                {renderSnapshot.resourceCount}개 · 콘솔 오류{" "}
+                {renderSnapshot.consoleErrorCount}개
+              </p>
+            ) : null}
             <p>*미리보기 화면이 제대로 표시되지 않나요?</p>
             <p>
               분석툴 IP가 화이트리스트에 등록되지 않으면 방화벽에 의해 사이트

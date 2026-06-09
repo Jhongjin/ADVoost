@@ -32,6 +32,24 @@ export interface KeywordSummary {
   phraseRows: KeywordRow[];
 }
 
+export interface RenderSnapshot {
+  success: boolean;
+  finalUrl?: string;
+  loadTimeMs?: number;
+  domContentLoadedMs?: number;
+  firstContentfulPaintMs?: number;
+  resourceCount: number;
+  failedRequestCount: number;
+  consoleErrorCount: number;
+  blockedResourceCount: number;
+  slowResources: string[];
+  failedRequests: string[];
+  consoleErrors: string[];
+  desktopScreenshot?: string;
+  mobileScreenshot?: string;
+  error?: string;
+}
+
 export interface ApiAuditItem {
   id: string;
   item_name: string;
@@ -62,6 +80,24 @@ export interface ApiKeywordSummary {
   phrase_rows: ApiKeywordRow[];
 }
 
+export interface ApiRenderSnapshot {
+  success: boolean;
+  final_url?: string | null;
+  load_time_ms?: number | null;
+  dom_content_loaded_ms?: number | null;
+  first_contentful_paint_ms?: number | null;
+  resource_count: number;
+  failed_request_count: number;
+  console_error_count: number;
+  blocked_resource_count: number;
+  slow_resources: string[];
+  failed_requests: string[];
+  console_errors: string[];
+  desktop_screenshot?: string | null;
+  mobile_screenshot?: string | null;
+  error?: string | null;
+}
+
 export interface ApiAuditResponse {
   id: string;
   url: string;
@@ -71,6 +107,7 @@ export interface ApiAuditResponse {
   score: number;
   items: ApiAuditItem[];
   keyword_summary?: ApiKeywordSummary | null;
+  render_snapshot?: ApiRenderSnapshot | null;
   cache_hit: boolean;
   created_at: string;
   duration_sec: number;
@@ -88,6 +125,7 @@ export interface AuditRecord {
   status: "완료" | "처리중" | "실패";
   items: AuditItem[];
   keywordSummary?: KeywordSummary;
+  renderSnapshot?: RenderSnapshot;
 }
 
 export interface ManagedUrl {
@@ -232,6 +270,25 @@ export function apiResponseToRecord(response: ApiAuditResponse): AuditRecord {
     titleOk: row.title_tag,
     descOk: row.meta_description,
   });
+  const mapRenderSnapshot = (
+    snapshot: ApiRenderSnapshot,
+  ): RenderSnapshot => ({
+    success: snapshot.success,
+    finalUrl: snapshot.final_url ?? undefined,
+    loadTimeMs: snapshot.load_time_ms ?? undefined,
+    domContentLoadedMs: snapshot.dom_content_loaded_ms ?? undefined,
+    firstContentfulPaintMs: snapshot.first_contentful_paint_ms ?? undefined,
+    resourceCount: snapshot.resource_count,
+    failedRequestCount: snapshot.failed_request_count,
+    consoleErrorCount: snapshot.console_error_count,
+    blockedResourceCount: snapshot.blocked_resource_count,
+    slowResources: snapshot.slow_resources,
+    failedRequests: snapshot.failed_requests,
+    consoleErrors: snapshot.console_errors,
+    desktopScreenshot: snapshot.desktop_screenshot ?? undefined,
+    mobileScreenshot: snapshot.mobile_screenshot ?? undefined,
+    error: snapshot.error ?? undefined,
+  });
 
   return {
     id: response.id,
@@ -250,6 +307,9 @@ export function apiResponseToRecord(response: ApiAuditResponse): AuditRecord {
           singleRows: response.keyword_summary.single_rows.map(mapKeywordRow),
           phraseRows: response.keyword_summary.phrase_rows.map(mapKeywordRow),
         }
+      : undefined,
+    renderSnapshot: response.render_snapshot
+      ? mapRenderSnapshot(response.render_snapshot)
       : undefined,
     items: response.items.map((item) => ({
       id: item.id,

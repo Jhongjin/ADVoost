@@ -16,6 +16,7 @@ npm run dev
 
 ```bash
 C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m pip install -r requirements.txt
+C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m playwright install chromium
 C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m uvicorn main:app --reload --port 8000
 ```
 
@@ -43,6 +44,20 @@ FastAPI는 기본적으로 로컬 개발 주소와 `https://ad-voost.vercel.app`
 CORS_ORIGINS=https://ad-voost.vercel.app,https://your-preview.vercel.app
 ```
 
+Render에서 브라우저 렌더링 분석과 데스크톱/모바일 캡처를 사용하려면 Web Service의 Build Command를 아래처럼 설정하세요.
+
+```bash
+pip install -r requirements.txt && python -m playwright install chromium
+```
+
+Start Command는 기존과 동일합니다.
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Chromium 설치 전이거나 실행이 막힌 환경에서는 API가 실패하지 않고 기존 HTML 파싱 분석으로 자동 대체됩니다. 브라우저 렌더링을 끄고 싶을 때는 Render 환경변수에 `ENABLE_BROWSER_AUDIT=0`을 설정하세요.
+
 ## 구현 범위
 
 - 대시보드: 통과/경고/실패 지표, 평균 점수, 최근 분석, 기술 지원 현황
@@ -52,4 +67,5 @@ CORS_ORIGINS=https://ad-voost.vercel.app,https://your-preview.vercel.app
 - 일괄 분석: 선택 URL 큐 등록, 진행 상태, 실패 URL 상태 반영
 - URL 관리: 개별 등록, CSV 대량 등록, 오류 행 스킵, 일괄 분석 화면으로 선택 상태 인계
 - FastAPI `/api/audit`: HTML 수집, BeautifulSoup 파싱, SQLite 72시간 캐시, ADVoost식 핵심 경고 강등 기반 등급 산정
+- 브라우저 렌더링 분석: Playwright 기반 JS 실행 후 DOM 파싱, 데스크톱/모바일 캡처, Navigation Timing, 콘솔 오류/실패 요청 수집
 - 프론트/API 연결: API 응답을 리포트 모델로 변환해 단건 및 일괄 분석 결과에 반영

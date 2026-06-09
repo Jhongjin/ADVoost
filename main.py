@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import time
+import base64
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+except Exception:  # Playwright is optional until the browser worker is installed.
+    PlaywrightError = Exception
+    PlaywrightTimeoutError = Exception
+    sync_playwright = None
+
 
 Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
 Severity = Literal["critical", "major", "minor", "info"]
@@ -26,6 +36,8 @@ Grade = Literal["A", "B", "C", "D", "F"]
 DB_PATH = Path(__file__).with_name("advoost.sqlite3")
 CACHE_HOURS = 72
 USER_AGENT = "ADVoost-AuditBot/1.0 (+https://advoost.local)"
+BROWSER_AUDIT_ENABLED = os.getenv("ENABLE_BROWSER_AUDIT", "1") != "0"
+BROWSER_AUDIT_TIMEOUT_MS = int(os.getenv("BROWSER_AUDIT_TIMEOUT_MS", "15000"))
 DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -70,6 +82,24 @@ class KeywordSummary(BaseModel):
     phrase_rows: list[KeywordRow] = Field(default_factory=list)
 
 
+class RenderSnapshot(BaseModel):
+    success: bool
+    final_url: str | None = None
+    load_time_ms: int | None = None
+    dom_content_loaded_ms: int | None = None
+    first_contentful_paint_ms: int | None = None
+    resource_count: int = 0
+    failed_request_count: int = 0
+    console_error_count: int = 0
+    blocked_resource_count: int = 0
+    slow_resources: list[str] = Field(default_factory=list)
+    failed_requests: list[str] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list)
+    desktop_screenshot: str | None = None
+    mobile_screenshot: str | None = None
+    error: str | None = None
+
+
 class AuditResponse(BaseModel):
     id: str
     url: str
@@ -83,6 +113,7 @@ class AuditResponse(BaseModel):
     fail_items: list[AuditItem]
     warning_items: list[AuditItem]
     keyword_summary: KeywordSummary | None = None
+    render_snapshot: RenderSnapshot | None = None
     cache_hit: bool
     cache_expires_at: str | None
     created_at: str
@@ -241,6 +272,9 @@ def infer_detected_value(item: AuditItem) -> str:
         return "favicon 존재" if item.status == "PASS" else "favicon 누락"
     if item.id == "page-size":
         return "권장 범위" if item.status == "PASS" else "용량 확인 필요"
+    if item.id == "script-error":
+        count = first_count(text)
+        return f"콘솔 오류 {count}개" if count and item.status != "PASS" else "통과"
     if item.id == "ssl":
         return "HTTPS" if item.status == "PASS" else "HTTP"
     if item.id == "form-labels":
@@ -416,6 +450,144 @@ def extract_keyword_summary(html: str) -> KeywordSummary | None:
     )
 
 
+def screenshot_data_url(payload: bytes) -> str:
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def unavailable_render_snapshot(reason: str) -> tuple[RenderSnapshot, str | None]:
+    return RenderSnapshot(success=False, error=compact_snippet(reason, 260)), None
+
+
+def collect_render_snapshot(url: str) -> tuple[RenderSnapshot, str | None]:
+    if not BROWSER_AUDIT_ENABLED:
+        return unavailable_render_snapshot("Browser rendering audit is disabled.")
+    if sync_playwright is None:
+        return unavailable_render_snapshot("Playwright is not installed.")
+
+    console_errors: list[str] = []
+    failed_requests: list[str] = []
+    rendered_html: str | None = None
+    desktop_screenshot: str | None = None
+    mobile_screenshot: str | None = None
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            desktop_context = browser.new_context(
+                viewport={"width": 1365, "height": 768},
+                device_scale_factor=1,
+                user_agent=USER_AGENT,
+                ignore_https_errors=True,
+            )
+            page = desktop_context.new_page()
+
+            def remember_console_error(message) -> None:
+                if message.type == "error" and len(console_errors) < 12:
+                    console_errors.append(compact_snippet(message.text, 260))
+
+            def remember_page_error(error) -> None:
+                if len(console_errors) < 12:
+                    console_errors.append(compact_snippet(str(error), 260))
+
+            def remember_failed_request(request) -> None:
+                if len(failed_requests) < 12:
+                    failure = request.failure or ""
+                    failed_requests.append(
+                        compact_snippet(f"{request.method} {request.url} {failure}", 260)
+                    )
+
+            page.on("console", remember_console_error)
+            page.on("pageerror", remember_page_error)
+            page.on("requestfailed", remember_failed_request)
+
+            page.goto(url, wait_until="load", timeout=BROWSER_AUDIT_TIMEOUT_MS)
+            page.wait_for_timeout(600)
+            rendered_html = page.content()
+            metrics = page.evaluate(
+                """
+                () => {
+                  const nav = performance.getEntriesByType('navigation')[0];
+                  const fcp = performance
+                    .getEntriesByType('paint')
+                    .find((entry) => entry.name === 'first-contentful-paint');
+                  const resources = performance.getEntriesByType('resource');
+                  const slowResources = resources
+                    .filter((entry) => entry.duration > 1200)
+                    .sort((left, right) => right.duration - left.duration)
+                    .slice(0, 8)
+                    .map((entry) => `${Math.round(entry.duration)} ms ${entry.initiatorType || 'resource'} ${entry.name}`);
+                  const blockingResources = resources.filter((entry) =>
+                    ['script', 'css', 'link'].includes(entry.initiatorType) &&
+                    entry.duration > 700
+                  );
+                  return {
+                    finalUrl: location.href,
+                    loadTime: nav ? Math.round(nav.loadEventEnd || nav.duration || 0) : null,
+                    domContentLoaded: nav ? Math.round(nav.domContentLoadedEventEnd || 0) : null,
+                    firstContentfulPaint: fcp ? Math.round(fcp.startTime) : null,
+                    resourceCount: resources.length,
+                    blockedResourceCount: blockingResources.length,
+                    slowResources,
+                  };
+                }
+                """
+            )
+            desktop_screenshot = screenshot_data_url(
+                page.screenshot(type="jpeg", quality=58, full_page=False)
+            )
+            desktop_context.close()
+
+            mobile_context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                device_scale_factor=2,
+                is_mobile=True,
+                has_touch=True,
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                    "Mobile/15E148 Safari/604.1 ADVoost-AuditBot/1.0"
+                ),
+                ignore_https_errors=True,
+            )
+            mobile_page = mobile_context.new_page()
+            mobile_page.goto(url, wait_until="load", timeout=BROWSER_AUDIT_TIMEOUT_MS)
+            mobile_page.wait_for_timeout(600)
+            mobile_screenshot = screenshot_data_url(
+                mobile_page.screenshot(type="jpeg", quality=55, full_page=False)
+            )
+            mobile_context.close()
+            browser.close()
+
+            return (
+                RenderSnapshot(
+                    success=True,
+                    final_url=metrics.get("finalUrl") or url,
+                    load_time_ms=metrics.get("loadTime"),
+                    dom_content_loaded_ms=metrics.get("domContentLoaded"),
+                    first_contentful_paint_ms=metrics.get("firstContentfulPaint"),
+                    resource_count=metrics.get("resourceCount") or 0,
+                    failed_request_count=len(failed_requests),
+                    console_error_count=len(console_errors),
+                    blocked_resource_count=metrics.get("blockedResourceCount") or 0,
+                    slow_resources=[
+                        compact_snippet(resource, 260)
+                        for resource in (metrics.get("slowResources") or [])
+                    ],
+                    failed_requests=failed_requests,
+                    console_errors=console_errors,
+                    desktop_screenshot=desktop_screenshot,
+                    mobile_screenshot=mobile_screenshot,
+                ),
+                rendered_html,
+            )
+    except (PlaywrightTimeoutError, PlaywrightError, Exception) as exc:
+        return unavailable_render_snapshot(f"{exc.__class__.__name__}: {exc}")
+
+
 def robots_blocks_all(text: str) -> bool:
     active_for_all = False
     for raw_line in text.splitlines():
@@ -553,6 +725,7 @@ def build_audit_items(
     fetch_error: str | None,
     robots_item: AuditItem,
     response_ms: int,
+    render_snapshot: RenderSnapshot | None = None,
 ) -> list[AuditItem]:
     items: list[AuditItem] = []
 
@@ -860,7 +1033,17 @@ def build_audit_items(
         )
 
     blocked_resources = blocking_resource_snippets(soup)
-    has_blocked_resource_warning = len(blocked_resources) >= 5
+    rendered_blocked_count = (
+        render_snapshot.blocked_resource_count
+        if render_snapshot and render_snapshot.success
+        else 0
+    )
+    blocked_resource_count = max(len(blocked_resources), rendered_blocked_count)
+    blocked_resource_snippet = "\n".join(
+        (render_snapshot.slow_resources if render_snapshot and render_snapshot.success else [])
+        or blocked_resources[:5]
+    )
+    has_blocked_resource_warning = blocked_resource_count >= 5
     items.append(
         AuditItem(
             id="render-blocked-resources",
@@ -875,7 +1058,7 @@ def build_audit_items(
                 else "렌더링을 차단하는 리소스가 발견되지 않았습니다."
             ),
             guide="렌더링을 차단하는 스크립트/스타일시트가 있으면 비동기 로딩을 적용하세요.",
-            snippet="\n".join(blocked_resources[:5]) if has_blocked_resource_warning else None,
+            snippet=blocked_resource_snippet if has_blocked_resource_warning else None,
         )
     )
 
@@ -904,7 +1087,11 @@ def build_audit_items(
         )
     )
 
-    download_ms = estimated_download_ms(html, response_ms, len(blocked_resources))
+    download_ms = (
+        render_snapshot.load_time_ms
+        if render_snapshot and render_snapshot.success and render_snapshot.load_time_ms
+        else estimated_download_ms(html, response_ms, len(blocked_resources))
+    )
     items.append(
         AuditItem(
             id="download-time",
@@ -999,7 +1186,22 @@ def build_audit_items(
         )
     )
 
-    add_passed_runtime_check(items, "script-error", "크리티컬 스크립트 에러", "기술")
+    if render_snapshot and render_snapshot.success and render_snapshot.console_error_count:
+        items.append(
+            AuditItem(
+                id="script-error",
+                item_name="크리티컬 스크립트 에러",
+                category="기술",
+                status="WARNING",
+                severity="critical",
+                critical_for_grade=True,
+                description=f"브라우저 콘솔 오류가 {render_snapshot.console_error_count}개 발견되었습니다.",
+                guide="런타임 오류는 랜딩 화면 누락, 태그 실행 실패, 전환 이벤트 누락으로 이어질 수 있습니다.",
+                snippet="\n".join(render_snapshot.console_errors[:6]),
+            )
+        )
+    else:
+        add_passed_runtime_check(items, "script-error", "크리티컬 스크립트 에러", "기술")
     add_passed_runtime_check(items, "broken-links", "깨진 링크", "기술")
     add_passed_runtime_check(items, "tap-target", "모바일 터치 영역", "모바일")
 
@@ -1135,7 +1337,9 @@ def load_cached(user_id: str, url: str) -> AuditResponse | None:
         return None
 
     payload = json.loads(row["payload"])
-    if "keyword_summary" not in payload:
+    if "keyword_summary" not in payload or "render_snapshot" not in payload:
+        return None
+    if BROWSER_AUDIT_ENABLED and not payload.get("render_snapshot", {}).get("success"):
         return None
     created_at = datetime.fromisoformat(payload["created_at"])
     payload["cache_hit"] = True
@@ -1226,11 +1430,23 @@ def audit(request: AuditRequest) -> AuditResponse:
 
         robots_item = inspect_robots(final_url, client)
 
+    render_snapshot: RenderSnapshot | None = None
+    rendered_html: str | None = None
+    if fetch_error is None and (status_code or 0) < 400:
+        render_snapshot, rendered_html = collect_render_snapshot(final_url)
+
+    analysis_html = rendered_html or html
     items = build_audit_items(
-        final_url, html, status_code, fetch_error, robots_item, response_ms
+        final_url,
+        analysis_html,
+        status_code,
+        fetch_error,
+        robots_item,
+        response_ms,
+        render_snapshot,
     )
     keyword_summary = (
-        extract_keyword_summary(html)
+        extract_keyword_summary(analysis_html)
         if fetch_error is None and (status_code or 0) < 400
         else None
     )
@@ -1255,6 +1471,7 @@ def audit(request: AuditRequest) -> AuditResponse:
         fail_items=[item for item in items if item.status == "FAIL"],
         warning_items=[item for item in items if item.status == "WARNING"],
         keyword_summary=keyword_summary,
+        render_snapshot=render_snapshot,
         cache_hit=False,
         cache_expires_at=(datetime.fromisoformat(created_at) + timedelta(hours=CACHE_HOURS)).isoformat(),
         created_at=created_at,
