@@ -150,6 +150,18 @@ function getDisplayHost(rawUrl: string) {
   }
 }
 
+function formatHistoryDate(value: string) {
+  const date = new Date(value);
+  const year = `${date.getFullYear()}`.slice(-2);
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = date.getHours();
+  const minutes = `${date.getMinutes()}`.padStart(2, "0");
+  const period = hours >= 12 ? "오후" : "오전";
+  const hour12 = hours % 12 || 12;
+  return `${year}. ${month}. ${day}. ${period} ${hour12}:${minutes}`;
+}
+
 function CountsInline({ record }: { record: AuditRecord }) {
   const counts = countItems(record.items);
   return (
@@ -227,9 +239,9 @@ export default function Home() {
     ids: string[];
   } | null>(null);
   const [singleForm, setSingleForm] = useState({
-    url: "https://blog.nasmedia.co.kr/",
-    managerName: "-",
-    advertiserName: "나스미디어",
+    url: "",
+    managerName: "",
+    advertiserName: "",
   });
   const [urlForm, setUrlForm] = useState({
     url: "",
@@ -827,7 +839,7 @@ export default function Home() {
                     <GradeBadge grade={record.grade} />
                   </span>
                   <CountsInline record={record} />
-                  <span>{formatFullDate(record.createdAt)}</span>
+                  <span>{formatHistoryDate(record.createdAt)}</span>
                   <span>{record.managerName}</span>
                   <span>{record.advertiserName}</span>
                   <span className="history-actions">

@@ -1813,6 +1813,7 @@ textarea::placeholder {
 
 .history-actions {
   gap: 4px;
+  overflow: visible;
 }
 
 .rows-label {
@@ -1875,15 +1876,15 @@ textarea::placeholder {
 }
 
 .history-table {
-  overflow-x: hidden;
+  overflow-x: auto;
   border-top: 1px solid #e4eaf0;
 }
 
 .history-table-row {
   display: grid;
-  grid-template-columns: 28px minmax(238px, 1fr) 72px 46px 106px 112px 60px 64px 132px;
+  grid-template-columns: 28px minmax(260px, 1fr) 66px 46px 108px 132px 70px 86px 148px;
   align-items: center;
-  min-width: 0;
+  min-width: 1008px;
   min-height: 52px;
   padding: 0 14px;
   gap: 8px;
@@ -1898,6 +1899,9 @@ textarea::placeholder {
 
 .history-table-row > * {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .history-table-head {
@@ -1912,6 +1916,8 @@ textarea::placeholder {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .history-url-cell strong {
@@ -1919,6 +1925,10 @@ textarea::placeholder {
   color: #111827;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.history-table-row .history-actions {
+  overflow: visible;
 }
 
 .complete-badge {
