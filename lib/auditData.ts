@@ -17,6 +17,21 @@ export interface AuditItem {
   snippet?: string;
 }
 
+export interface KeywordRow {
+  keyword: string;
+  frequency: number;
+  ratio: string;
+  titleOk: boolean;
+  descOk: boolean;
+}
+
+export interface KeywordSummary {
+  singleTotal: number;
+  phraseTotal: number;
+  singleRows: KeywordRow[];
+  phraseRows: KeywordRow[];
+}
+
 export interface ApiAuditItem {
   id: string;
   item_name: string;
@@ -32,6 +47,21 @@ export interface ApiAuditItem {
   snippet?: string | null;
 }
 
+export interface ApiKeywordRow {
+  keyword: string;
+  frequency: number;
+  ratio: string;
+  title_tag: boolean;
+  meta_description: boolean;
+}
+
+export interface ApiKeywordSummary {
+  single_total: number;
+  phrase_total: number;
+  single_rows: ApiKeywordRow[];
+  phrase_rows: ApiKeywordRow[];
+}
+
 export interface ApiAuditResponse {
   id: string;
   url: string;
@@ -40,6 +70,7 @@ export interface ApiAuditResponse {
   grade: AuditGrade;
   score: number;
   items: ApiAuditItem[];
+  keyword_summary?: ApiKeywordSummary | null;
   cache_hit: boolean;
   created_at: string;
   duration_sec: number;
@@ -56,6 +87,7 @@ export interface AuditRecord {
   durationSec: number;
   status: "완료" | "처리중" | "실패";
   items: AuditItem[];
+  keywordSummary?: KeywordSummary;
 }
 
 export interface ManagedUrl {
@@ -193,6 +225,14 @@ export function getCriticalWarnings(items: AuditItem[]) {
 }
 
 export function apiResponseToRecord(response: ApiAuditResponse): AuditRecord {
+  const mapKeywordRow = (row: ApiKeywordRow): KeywordRow => ({
+    keyword: row.keyword,
+    frequency: row.frequency,
+    ratio: row.ratio,
+    titleOk: row.title_tag,
+    descOk: row.meta_description,
+  });
+
   return {
     id: response.id,
     url: response.url,
@@ -203,6 +243,14 @@ export function apiResponseToRecord(response: ApiAuditResponse): AuditRecord {
     createdAt: response.created_at,
     durationSec: response.duration_sec,
     status: response.grade === "F" ? "실패" : "완료",
+    keywordSummary: response.keyword_summary
+      ? {
+          singleTotal: response.keyword_summary.single_total,
+          phraseTotal: response.keyword_summary.phrase_total,
+          singleRows: response.keyword_summary.single_rows.map(mapKeywordRow),
+          phraseRows: response.keyword_summary.phrase_rows.map(mapKeywordRow),
+        }
+      : undefined,
     items: response.items.map((item) => ({
       id: item.id,
       itemName: item.item_name,

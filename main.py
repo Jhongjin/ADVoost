@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -54,6 +55,21 @@ class AuditItem(BaseModel):
     snippet: str | None = None
 
 
+class KeywordRow(BaseModel):
+    keyword: str
+    frequency: int
+    ratio: str
+    title_tag: bool
+    meta_description: bool
+
+
+class KeywordSummary(BaseModel):
+    single_total: int
+    phrase_total: int
+    single_rows: list[KeywordRow] = Field(default_factory=list)
+    phrase_rows: list[KeywordRow] = Field(default_factory=list)
+
+
 class AuditResponse(BaseModel):
     id: str
     url: str
@@ -66,6 +82,7 @@ class AuditResponse(BaseModel):
     items: list[AuditItem]
     fail_items: list[AuditItem]
     warning_items: list[AuditItem]
+    keyword_summary: KeywordSummary | None = None
     cache_hit: bool
     cache_expires_at: str | None
     created_at: str
@@ -261,6 +278,142 @@ def meta_content(tag: object) -> str:
     if tag is None:
         return ""
     return str(getattr(tag, "get", lambda *_: "")("content") or "").strip()
+
+
+KEYWORD_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "are",
+    "was",
+    "were",
+    "have",
+    "has",
+    "not",
+    "you",
+    "your",
+    "our",
+    "www",
+    "com",
+    "co",
+    "kr",
+    "http",
+    "https",
+    "있습니다",
+    "합니다",
+    "그리고",
+    "또는",
+    "대한",
+    "관련",
+    "위한",
+    "에서",
+    "으로",
+    "에게",
+    "하는",
+    "되어",
+    "있는",
+    "없는",
+    "우리",
+    "전체",
+    "자세히",
+    "보기",
+    "바로가기",
+    "메뉴",
+    "본문",
+    "검색",
+    "닫기",
+}
+
+KEYWORD_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9][가-힣A-Za-z0-9._+-]*")
+
+
+def keyword_visible_text(soup: BeautifulSoup) -> str:
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "template"]):
+        tag.decompose()
+    return soup.get_text(" ", strip=True)
+
+
+def normalize_keyword_token(token: str) -> str | None:
+    normalized = token.strip("._+-").lower()
+    if len(normalized) < 2:
+        return None
+    if normalized.isdigit():
+        return None
+    if normalized in KEYWORD_STOPWORDS:
+        return None
+    return normalized
+
+
+def tokenize_keywords(text: str) -> list[str]:
+    tokens: list[str] = []
+    for match in KEYWORD_TOKEN_RE.finditer(text):
+        token = normalize_keyword_token(match.group(0))
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def token_in_text(token: str, text: str) -> bool:
+    if not text:
+        return False
+    return token.lower() in text.lower()
+
+
+def build_keyword_rows(
+    counts: Counter[str],
+    denominator: int,
+    title_text: str,
+    description_text: str,
+    limit: int = 50,
+) -> list[KeywordRow]:
+    rows: list[KeywordRow] = []
+    for keyword, frequency in counts.most_common(limit):
+        ratio = (frequency / denominator * 100) if denominator else 0
+        rows.append(
+            KeywordRow(
+                keyword=keyword,
+                frequency=frequency,
+                ratio=f"{ratio:.2f}%",
+                title_tag=token_in_text(keyword, title_text),
+                meta_description=token_in_text(keyword, description_text),
+            )
+        )
+    return rows
+
+
+def extract_keyword_summary(html: str) -> KeywordSummary | None:
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_text = soup.find("title").get_text(" ", strip=True) if soup.find("title") else ""
+    description_text = meta_content(find_meta(soup, name="description"))
+    visible_text = keyword_visible_text(soup)
+    tokens = tokenize_keywords(visible_text)
+    if not tokens:
+        return KeywordSummary(single_total=0, phrase_total=0)
+
+    single_counts: Counter[str] = Counter(tokens)
+    phrases = [
+        f"{left} {right}"
+        for left, right in zip(tokens, tokens[1:])
+        if left != right
+    ]
+    phrase_counts: Counter[str] = Counter(phrases)
+    return KeywordSummary(
+        single_total=len(single_counts),
+        phrase_total=len(phrase_counts),
+        single_rows=build_keyword_rows(
+            single_counts, len(tokens), title_text, description_text
+        ),
+        phrase_rows=build_keyword_rows(
+            phrase_counts, max(len(phrases), 1), title_text, description_text
+        ),
+    )
 
 
 def robots_blocks_all(text: str) -> bool:
@@ -903,7 +1056,7 @@ def build_audit_items(
         )
     )
 
-    visible_text = soup.get_text(" ", strip=True)
+    visible_text = keyword_visible_text(soup)
     word_count = len(re.findall(r"[A-Za-z가-힣0-9]{2,}", visible_text))
     items.append(
         AuditItem(
@@ -982,6 +1135,8 @@ def load_cached(user_id: str, url: str) -> AuditResponse | None:
         return None
 
     payload = json.loads(row["payload"])
+    if "keyword_summary" not in payload:
+        return None
     created_at = datetime.fromisoformat(payload["created_at"])
     payload["cache_hit"] = True
     payload["cache_expires_at"] = (
@@ -1074,6 +1229,11 @@ def audit(request: AuditRequest) -> AuditResponse:
     items = build_audit_items(
         final_url, html, status_code, fetch_error, robots_item, response_ms
     )
+    keyword_summary = (
+        extract_keyword_summary(html)
+        if fetch_error is None and (status_code or 0) < 400
+        else None
+    )
     items = enrich_audit_items(items)
     grade, score = calculate_seo_grade(items)
     counts = status_counts(items)
@@ -1094,6 +1254,7 @@ def audit(request: AuditRequest) -> AuditResponse:
         items=items,
         fail_items=[item for item in items if item.status == "FAIL"],
         warning_items=[item for item in items if item.status == "WARNING"],
+        keyword_summary=keyword_summary,
         cache_hit=False,
         cache_expires_at=(datetime.fromisoformat(created_at) + timedelta(hours=CACHE_HOURS)).isoformat(),
         created_at=created_at,

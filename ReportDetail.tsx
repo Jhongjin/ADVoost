@@ -18,7 +18,13 @@ import {
   Wrench,
   XCircle,
 } from "lucide-react";
-import type { AuditItem, AuditRecord, AuditStatus } from "./lib/auditData";
+import type {
+  AuditItem,
+  AuditRecord,
+  AuditStatus,
+  KeywordRow,
+  KeywordSummary,
+} from "./lib/auditData";
 import {
   countItems,
   formatFullDate,
@@ -88,14 +94,6 @@ const itemTitleOverrides: Record<string, string> = {
 
 type KeywordMode = "single" | "phrase";
 
-type KeywordRow = {
-  keyword: string;
-  frequency: number;
-  ratio: string;
-  titleOk: boolean;
-  descOk: boolean;
-};
-
 const singleKeywordRows: KeywordRow[] = [
   { keyword: "네이버", frequency: 6, ratio: "0.58%", titleOk: false, descOk: false },
   { keyword: "모바일", frequency: 5, ratio: "0.48%", titleOk: false, descOk: false },
@@ -151,6 +149,13 @@ const phraseKeywordRows: KeywordRow[] = [
   { keyword: "시장 변화", frequency: 1, ratio: "0.10%", titleOk: false, descOk: false },
   { keyword: "캠페인 성과", frequency: 1, ratio: "0.10%", titleOk: false, descOk: false },
 ];
+
+const fallbackKeywordSummary: KeywordSummary = {
+  singleTotal: 484,
+  phraseTotal: 513,
+  singleRows: singleKeywordRows,
+  phraseRows: phraseKeywordRows,
+};
 
 function toneClass(status: AuditStatus) {
   return status.toLowerCase().replace("_", "-");
@@ -317,8 +322,11 @@ export default function ReportDetail({
     (item) => item.category === "수집" && item.status === "FAIL",
   );
   const reportHost = getReportHost(record.url);
+  const keywordSummary = record.keywordSummary ?? fallbackKeywordSummary;
   const activeKeywordRows =
-    keywordMode === "single" ? singleKeywordRows : phraseKeywordRows;
+    keywordMode === "single"
+      ? keywordSummary.singleRows
+      : keywordSummary.phraseRows;
   const filteredKeywordRows = useMemo(() => {
     const query = keywordSearch.trim().toLowerCase();
     if (!query) {
@@ -537,7 +545,7 @@ export default function ReportDetail({
               setVisibleKeywordCount(10);
             }}
           >
-            개별 키워드 <span>(484)</span>
+            개별 키워드 <span>({keywordSummary.singleTotal})</span>
           </button>
           <button
             className={keywordMode === "phrase" ? "keyword-tab-button active" : "keyword-tab-button"}
@@ -547,7 +555,7 @@ export default function ReportDetail({
               setVisibleKeywordCount(10);
             }}
           >
-            프레이즈 (2어절) <span>(513)</span>
+            프레이즈 (2어절) <span>({keywordSummary.phraseTotal})</span>
           </button>
           <div className="search-field compact">
             <Search size={15} />
