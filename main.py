@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -24,6 +25,11 @@ Grade = Literal["A", "B", "C", "D", "F"]
 DB_PATH = Path(__file__).with_name("advoost.sqlite3")
 CACHE_HOURS = 72
 USER_AGENT = "ADVoost-AuditBot/1.0 (+https://advoost.local)"
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://ad-voost.vercel.app",
+]
 
 
 class AuditRequest(BaseModel):
@@ -71,9 +77,20 @@ app = FastAPI(
     version="0.1.0",
     description="HTML scraping, SEO checklist parsing, ADVoost-like grade calculation, and 72-hour result reuse.",
 )
+
+
+def cors_origins() -> list[str]:
+    configured = [
+        origin.strip().rstrip("/")
+        for origin in os.getenv("CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    return sorted(set(DEFAULT_CORS_ORIGINS + configured))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -31,6 +31,18 @@ NEXT_PUBLIC_AUDIT_API_URL=https://your-audit-api.example.com
 
 이 값을 설정하지 않으면 브라우저가 기본값인 `http://localhost:8000`으로 요청하므로, 배포 환경에서는 단건/일괄 분석 API 호출이 실패합니다.
 
+현재 배포 예시는 아래와 같습니다.
+
+```bash
+NEXT_PUBLIC_AUDIT_API_URL=https://advoost.onrender.com
+```
+
+FastAPI는 기본적으로 로컬 개발 주소와 `https://ad-voost.vercel.app`을 CORS 허용 목록에 포함합니다. Vercel 도메인을 바꾸거나 preview 도메인에서도 API를 호출하려면 Render 환경변수에 쉼표로 구분한 origin을 추가하세요.
+
+```bash
+CORS_ORIGINS=https://ad-voost.vercel.app,https://your-preview.vercel.app
+```
+
 ## 구현 범위
 
 - 대시보드: 통과/경고/실패 지표, 평균 점수, 최근 분석, 기술 지원 현황
