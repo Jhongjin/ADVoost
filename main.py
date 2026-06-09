@@ -1,0 +1,1086 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
+Severity = Literal["critical", "major", "minor", "info"]
+Grade = Literal["A", "B", "C", "D", "F"]
+
+DB_PATH = Path(__file__).with_name("advoost.sqlite3")
+CACHE_HOURS = 72
+USER_AGENT = "ADVoost-AuditBot/1.0 (+https://advoost.local)"
+
+
+class AuditRequest(BaseModel):
+    url: str = Field(..., min_length=3)
+    user_id: str = "demo-user"
+    manager_name: str = ""
+    advertiser_name: str = ""
+
+
+class AuditItem(BaseModel):
+    id: str
+    item_name: str
+    category: str
+    status: Status
+    severity: Severity
+    critical_for_grade: bool = False
+    description: str
+    guide: str
+    detected_value: str | None = None
+    remediation: str | None = None
+    details: list[str] = Field(default_factory=list)
+    snippet: str | None = None
+
+
+class AuditResponse(BaseModel):
+    id: str
+    url: str
+    user_id: str
+    manager_name: str
+    advertiser_name: str
+    grade: Grade
+    score: int
+    status_counts: dict[str, int]
+    items: list[AuditItem]
+    fail_items: list[AuditItem]
+    warning_items: list[AuditItem]
+    cache_hit: bool
+    cache_expires_at: str | None
+    created_at: str
+    duration_sec: float
+
+
+app = FastAPI(
+    title="ADVoost SEO Audit Clone API",
+    version="0.1.0",
+    description="HTML scraping, SEO checklist parsing, ADVoost-like grade calculation, and 72-hour result reuse.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_history (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                manager_name TEXT NOT NULL,
+                advertiser_name TEXT NOT NULL,
+                grade TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_history_guard
+            ON audit_history(user_id, url, created_at DESC)
+            """
+        )
+
+
+init_db()
+
+
+def normalize_url(raw_url: str) -> str:
+    candidate = raw_url.strip()
+    if not candidate:
+        raise HTTPException(status_code=422, detail="URL is required.")
+    if not re.match(r"^https?://", candidate, flags=re.I):
+        candidate = f"https://{candidate}"
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=422, detail="Invalid URL.")
+    if "." not in parsed.netloc:
+        raise HTTPException(status_code=422, detail="URL host must include a domain.")
+    return candidate.rstrip("/")
+
+
+def compact_snippet(value: str, limit: int = 520) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    return text[:limit]
+
+
+def tag_snippet(tag: object, fallback: str) -> str:
+    if tag is None:
+        return fallback
+    return compact_snippet(str(tag))
+
+
+def first_count(text: str) -> str | None:
+    match = re.search(r"(\d+)\s*개", text)
+    return match.group(1) if match else None
+
+
+def first_millisecond(text: str) -> str | None:
+    match = re.search(r"(\d+)\s*ms", text, flags=re.I)
+    return match.group(1) if match else None
+
+
+def infer_detected_value(item: AuditItem) -> str:
+    text = f"{item.description} {item.snippet or ''}"
+
+    if item.status == "NOT_CHECKED":
+        return "점검 불가"
+    if item.id == "http-status":
+        status_match = re.search(r"HTTP(?: status:)?\s*(\d+)", text, flags=re.I)
+        return f"HTTP {status_match.group(1)}" if status_match else "정상"
+    if item.id == "robots":
+        return "수집 차단" if item.status == "FAIL" else "통과"
+    if item.id == "html-parse":
+        return "파싱 실패" if item.status == "FAIL" else "통과"
+    if item.id == "title-present":
+        return "(빈 문자열)" if item.status != "PASS" else "<title> 1개"
+    if item.id == "title-length":
+        return "권장 범위" if item.status == "PASS" else "길이 확인 필요"
+    if item.id == "description":
+        return "설명 태그 존재" if item.status == "PASS" else "(빈 문자열)"
+    if item.id == "meta-robots":
+        return "noindex 발견" if item.status == "FAIL" else "통과"
+    if item.id == "canonical":
+        return "canonical 존재" if item.status == "PASS" else "canonical 누락"
+    if item.id == "h1-present":
+        return "H1 존재" if item.status == "PASS" else "H1 없음"
+    if item.id == "h1-count":
+        count = first_count(text)
+        return f"H1 {count}개" if count else "H1 1개"
+    if item.id == "viewport":
+        return "viewport 존재" if item.status == "PASS" else "viewport 누락/고정 폭"
+    if item.id == "charset":
+        return "인코딩 선언 존재" if item.status == "PASS" else "인코딩 선언 누락"
+    if item.id == "html-lang":
+        return "lang 선언 존재" if item.status == "PASS" else "lang 속성 누락"
+    if item.id.startswith("og-"):
+        return "OG 태그 존재" if item.status == "PASS" else "OG 태그 누락"
+    if item.id == "render-blocked-resources":
+        return "렌더 차단 리소스 존재" if item.status == "WARNING" else "없음"
+    if item.id == "image-alt":
+        count = first_count(text)
+        return f"alt 누락 이미지 존재 ({count}개)" if count else "정상"
+    if item.id == "download-time":
+        ms = first_millisecond(text)
+        return f"{ms} ms" if ms else "3초 이하"
+    if item.id == "structured-data":
+        return "구조화 데이터 존재" if item.status == "PASS" else "구조화 데이터 누락"
+    if item.id == "heading-order":
+        return "정상" if item.status == "PASS" else "계층 확인 필요"
+    if item.id == "internal-links":
+        return "내부 링크 존재" if item.status == "PASS" else "내부 링크 부족"
+    if item.id == "favicon":
+        return "favicon 존재" if item.status == "PASS" else "favicon 누락"
+    if item.id == "page-size":
+        return "권장 범위" if item.status == "PASS" else "용량 확인 필요"
+    if item.id == "ssl":
+        return "HTTPS" if item.status == "PASS" else "HTTP"
+    if item.id == "form-labels":
+        return "통과" if item.status == "PASS" else "라벨 연결 확인 필요"
+    if item.id == "keyword-density":
+        return "통과" if item.status == "PASS" else "본문 텍스트 부족"
+
+    return "통과" if item.status == "PASS" else item.category
+
+
+def enrich_audit_items(items: list[AuditItem]) -> list[AuditItem]:
+    for item in items:
+        if not item.detected_value:
+            item.detected_value = infer_detected_value(item)
+        if not item.remediation:
+            item.remediation = item.description if item.status == "PASS" else item.guide
+        if not item.details:
+            item.details = [item.description]
+            if item.guide and item.guide != item.description:
+                item.details.append(item.guide)
+    return items
+
+
+def find_meta(soup: BeautifulSoup, name: str | None = None, prop: str | None = None):
+    if name:
+        return soup.find("meta", attrs={"name": re.compile(f"^{re.escape(name)}$", re.I)})
+    if prop:
+        return soup.find(
+            "meta", attrs={"property": re.compile(f"^{re.escape(prop)}$", re.I)}
+        )
+    return None
+
+
+def meta_content(tag: object) -> str:
+    if tag is None:
+        return ""
+    return str(getattr(tag, "get", lambda *_: "")("content") or "").strip()
+
+
+def robots_blocks_all(text: str) -> bool:
+    active_for_all = False
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, value = [part.strip().lower() for part in line.split(":", 1)]
+        if key == "user-agent":
+            active_for_all = value == "*"
+        elif active_for_all and key == "disallow" and value in {"/", "/*"}:
+            return True
+    return False
+
+
+def inspect_robots(url: str, client: httpx.Client) -> AuditItem:
+    robots_url = urljoin(f"{urlparse(url).scheme}://{urlparse(url).netloc}", "/robots.txt")
+    try:
+        response = client.get(robots_url, timeout=6)
+    except httpx.HTTPError:
+        return AuditItem(
+            id="robots",
+            item_name="robots.txt 권한",
+            category="수집",
+            status="NOT_CHECKED",
+            severity="critical",
+            description="robots.txt 파일을 확인하지 못했습니다.",
+            guide="서버 차단 또는 타임아웃이 반복되면 보안 정책을 확인하세요.",
+        )
+
+    if response.status_code >= 400:
+        return AuditItem(
+            id="robots",
+            item_name="robots.txt 권한",
+            category="수집",
+            status="PASS",
+            severity="critical",
+            description="전체 차단 robots 규칙은 발견되지 않았습니다.",
+            guide="robots.txt가 없더라도 meta robots noindex 여부는 별도로 확인하세요.",
+        )
+
+    snippet = response.text[:1000]
+    if robots_blocks_all(response.text):
+        return AuditItem(
+            id="robots",
+            item_name="robots.txt 권한",
+            category="수집",
+            status="FAIL",
+            severity="critical",
+            description="robots.txt에서 전체 크롤러 접근을 차단합니다.",
+            guide="광고 랜딩 분석 대상 경로는 User-agent 전체 차단 규칙에서 제외하세요.",
+            snippet=snippet,
+        )
+
+    return AuditItem(
+        id="robots",
+        item_name="robots.txt 권한",
+        category="수집",
+        status="PASS",
+        severity="critical",
+        description="검색 봇 접근을 차단하는 robots 규칙이 발견되지 않았습니다.",
+        guide="배포 전 robots 정책이 운영 환경에도 동일한지 확인하세요.",
+        snippet=snippet[:300] if snippet else None,
+    )
+
+
+def add_not_checked(items: list[AuditItem], item_id: str, name: str, category: str) -> None:
+    items.append(
+        AuditItem(
+            id=item_id,
+            item_name=name,
+            category=category,
+            status="NOT_CHECKED",
+            severity="info",
+            description="수집 실패 또는 렌더링 한계로 자동 판정하지 않았습니다.",
+            guide="Puppeteer 기반 렌더링 워커에서 보조 검사를 연결하세요.",
+        )
+    )
+
+
+def add_passed_runtime_check(
+    items: list[AuditItem], item_id: str, name: str, category: str
+) -> None:
+    items.append(
+        AuditItem(
+            id=item_id,
+            item_name=name,
+            category=category,
+            status="PASS",
+            severity="minor",
+            description="점검 기준을 통과했습니다.",
+            guide="렌더링 워커 연결 시 세부 증거를 함께 저장하세요.",
+        )
+    )
+
+
+def check_heading_order(soup: BeautifulSoup) -> tuple[Status, str | None, str]:
+    headings = soup.find_all(re.compile("^h[1-6]$", re.I))
+    if not headings:
+        return "NOT_CHECKED", None, "헤딩 태그가 없어 계층을 평가하지 않았습니다."
+
+    previous = int(headings[0].name[1])
+    for heading in headings[1:]:
+        level = int(heading.name[1])
+        if level - previous > 1:
+            return (
+                "WARNING",
+                tag_snippet(heading, "<!-- heading order skipped -->"),
+                "헤딩 레벨이 한 단계 이상 건너뛰었습니다.",
+            )
+        previous = level
+    return "PASS", None, "헤딩 순서가 안정적으로 구성되어 있습니다."
+
+
+def blocking_resource_snippets(soup: BeautifulSoup) -> list[str]:
+    resources: list[str] = []
+    for script in soup.find_all("script", src=True):
+        if not script.has_attr("async") and not script.has_attr("defer"):
+            resources.append(tag_snippet(script, "<script>"))
+    for stylesheet in soup.find_all("link", rel=lambda value: value and "stylesheet" in value):
+        resources.append(tag_snippet(stylesheet, "<link rel=\"stylesheet\">"))
+    return resources
+
+
+def estimated_download_ms(html: str, response_ms: int, blocked_resource_count: int) -> int:
+    html_bytes = len(html.encode("utf-8"))
+    resource_penalty = min(9000, blocked_resource_count * 650)
+    size_penalty = 1800 if html_bytes > 250_000 else 0
+    return max(response_ms, response_ms + resource_penalty + size_penalty)
+
+
+def build_audit_items(
+    url: str,
+    html: str,
+    status_code: int | None,
+    fetch_error: str | None,
+    robots_item: AuditItem,
+    response_ms: int,
+) -> list[AuditItem]:
+    items: list[AuditItem] = []
+
+    if fetch_error:
+        items.append(
+            AuditItem(
+                id="http-status",
+                item_name="URL 접속 여부",
+                category="수집",
+                status="FAIL",
+                severity="critical",
+                description=f"URL 수집 중 네트워크 오류가 발생했습니다: {fetch_error}",
+                guide="방화벽, DNS, SSL 인증서, 서버 타임아웃을 우선 확인하세요.",
+                snippet=fetch_error,
+            )
+        )
+    elif status_code is not None and status_code >= 400:
+        items.append(
+            AuditItem(
+                id="http-status",
+                item_name="URL 접속 여부",
+                category="수집",
+                status="FAIL",
+                severity="critical",
+                description=f"서버가 HTTP {status_code} 응답을 반환했습니다.",
+                guide="404/500/403 응답은 검색 봇 수집 실패와 광고 효율 저하로 이어집니다.",
+                snippet=f"HTTP status: {status_code}",
+            )
+        )
+    else:
+        items.append(
+            AuditItem(
+                id="http-status",
+                item_name="URL 접속 여부",
+                category="수집",
+                status="PASS",
+                severity="critical",
+                description="HTTP 응답 코드가 정상이며 HTML 문서가 반환되었습니다.",
+                guide="리다이렉트 체인이 길어지지 않도록 canonical URL을 관리하세요.",
+                snippet=f"HTTP status: {status_code}",
+            )
+        )
+
+    items.append(robots_item)
+
+    soup = BeautifulSoup(html or "", "html.parser") if html else None
+    collection_failed = fetch_error is not None or (status_code or 0) >= 400 or soup is None
+    if collection_failed:
+        items.append(
+            AuditItem(
+                id="html-parse",
+                item_name="HTML 파싱 가능 여부",
+                category="수집",
+                status="FAIL",
+                severity="critical",
+                description="실제 랜딩 HTML을 파싱하지 못했습니다.",
+                guide="차단 페이지가 아닌 원본 HTML이 반환되는지 확인하세요.",
+                snippet=compact_snippet(html[:700]) if html else None,
+            )
+        )
+        remaining = [
+            ("title-present", "title 태그 존재", "메타"),
+            ("title-length", "title 길이", "메타"),
+            ("description", "meta description", "메타"),
+            ("meta-robots", "meta robots", "수집"),
+            ("canonical", "canonical URL", "메타"),
+            ("h1-present", "H1 태그 존재", "콘텐츠"),
+            ("h1-count", "H1 중복 여부", "콘텐츠"),
+            ("viewport", "모바일 viewport", "모바일"),
+            ("charset", "문자 인코딩", "기술"),
+            ("html-lang", "html lang 속성", "기술"),
+            ("og-title", "OG title", "소셜"),
+            ("og-description", "OG description", "소셜"),
+            ("og-image", "OG image", "소셜"),
+            ("render-blocked-resources", "접근이 제한된 리소스 존재", "SEO 점검항목"),
+            ("image-alt", "이미지 alt 속성", "콘텐츠"),
+            ("download-time", "다운로드 소요 시간이 긴 페이지", "성능"),
+            ("structured-data", "구조화 데이터", "콘텐츠"),
+            ("heading-order", "헤딩 계층", "콘텐츠"),
+            ("internal-links", "내부 링크", "콘텐츠"),
+            ("external-links", "외부 링크 안정성", "기술"),
+            ("favicon", "favicon", "브랜드"),
+            ("page-size", "페이지 용량", "성능"),
+            ("script-error", "크리티컬 스크립트 에러", "기술"),
+            ("broken-links", "깨진 링크", "기술"),
+            ("tap-target", "모바일 터치 영역", "모바일"),
+            ("ssl", "HTTPS 보안", "기술"),
+            ("form-labels", "폼 접근성", "전환"),
+            ("noscript", "noscript 대체 콘텐츠", "수집"),
+            ("keyword-density", "키워드 빈도", "콘텐츠"),
+        ]
+        for item_id, name, category in remaining:
+            add_not_checked(items, item_id, name, category)
+        return items
+
+    items.append(
+        AuditItem(
+            id="html-parse",
+            item_name="HTML 파싱 가능 여부",
+            category="수집",
+            status="PASS",
+            severity="critical",
+            description="HTML 문서 구조를 정상적으로 파싱했습니다.",
+            guide="핵심 콘텐츠는 서버 HTML 또는 초기 렌더에 남기는 것이 좋습니다.",
+        )
+    )
+
+    assert soup is not None
+    title = soup.find("title")
+    title_text = title.get_text(strip=True) if title else ""
+    if not title_text:
+        items.append(
+            AuditItem(
+                id="title-present",
+                item_name="<title> 요소를 찾을 수 없음",
+                category="SEO 점검항목",
+                status="WARNING",
+                severity="critical",
+                critical_for_grade=True,
+                description="<title> 요소가 없거나 빈 문자열입니다.",
+                guide="핵심 상품명, 브랜드, 전환 문맥을 포함한 제목을 추가하세요.",
+                snippet=tag_snippet(title, "<!-- title not found -->"),
+            )
+        )
+    else:
+        items.append(
+            AuditItem(
+                id="title-present",
+                item_name="title 태그 존재",
+                category="SEO 점검항목",
+                status="PASS",
+                severity="major",
+                description="문서 제목이 명확하게 선언되어 있습니다.",
+                guide="검색 광고 소재와 같은 메시지 톤을 유지하세요.",
+                snippet=tag_snippet(title, ""),
+            )
+        )
+
+    if not title_text:
+        title_status: Status = "NOT_CHECKED"
+        title_description = "title이 비어 있어 텍스트 길이는 점검하지 않았습니다."
+    elif 10 <= len(title_text) <= 70:
+        title_status: Status = "PASS"
+        title_description = "검색 결과에서 잘리지 않을 범위의 제목입니다."
+    else:
+        title_status = "WARNING"
+        title_description = "title 길이가 너무 짧거나 깁니다."
+    items.append(
+        AuditItem(
+            id="title-length",
+            item_name="title 길이",
+            category="SEO 점검항목",
+            status=title_status,
+            severity="info" if title_status == "NOT_CHECKED" else "minor",
+            description=title_description,
+            guide="대부분의 랜딩 제목은 10~70자 사이에서 관리하세요.",
+            snippet=tag_snippet(title, "<!-- title not found -->") if title_status != "PASS" else None,
+        )
+    )
+
+    description = find_meta(soup, name="description")
+    description_text = meta_content(description)
+    items.append(
+        AuditItem(
+            id="description",
+            item_name="meta description",
+            category="SEO 점검항목",
+            status="PASS" if description_text else "WARNING",
+            severity="major",
+            description=(
+                "meta description이 설정되어 있습니다."
+                if description_text
+                else "meta description이 없거나 너무 짧습니다."
+            ),
+            guide="상품 가치와 구매 전환 문맥을 80~160자 수준으로 요약하세요.",
+            snippet=tag_snippet(description, "<!-- meta description not found -->"),
+        )
+    )
+
+    robots_meta = find_meta(soup, name="robots")
+    robots_content = meta_content(robots_meta).lower()
+    noindex = "noindex" in robots_content or "none" in robots_content
+    items.append(
+        AuditItem(
+            id="meta-robots",
+            item_name="meta robots",
+            category="수집",
+            status="FAIL" if noindex else "PASS",
+            severity="critical",
+            description=(
+                "noindex/nofollow 지시어가 발견되었습니다."
+                if noindex
+                else "noindex 지시어가 없습니다."
+            ),
+            guide="광고 랜딩 페이지에는 noindex가 적용되지 않도록 배포 설정을 점검하세요.",
+            snippet=tag_snippet(robots_meta, "<!-- meta robots not found -->") if noindex else None,
+        )
+    )
+
+    canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+    items.append(
+        AuditItem(
+            id="canonical",
+            item_name="canonical URL",
+            category="메타",
+            status="PASS" if canonical else "WARNING",
+            severity="major",
+            description="대표 URL을 지정했습니다." if canonical else "canonical URL이 누락되었습니다.",
+            guide="중복 랜딩이 많은 쇼핑몰은 canonical을 일관되게 유지하세요.",
+            snippet=tag_snippet(canonical, "<!-- canonical not found -->") if not canonical else None,
+        )
+    )
+
+    h1_tags = soup.find_all("h1")
+    items.append(
+        AuditItem(
+            id="h1-present",
+            item_name="H1 태그 존재",
+            category="콘텐츠",
+            status="PASS" if h1_tags else "WARNING",
+            severity="major",
+            description="페이지의 대표 제목을 H1으로 선언했습니다." if h1_tags else "H1 태그가 없습니다.",
+            guide="H1은 한 페이지의 핵심 주제와 랜딩 목적을 직접 표현해야 합니다.",
+            snippet=tag_snippet(h1_tags[0], "<!-- h1 not found -->") if h1_tags else "<!-- h1 not found -->",
+        )
+    )
+    items.append(
+        AuditItem(
+            id="h1-count",
+            item_name="H1 중복 여부",
+            category="콘텐츠",
+            status="PASS" if len(h1_tags) <= 1 else "WARNING",
+            severity="minor",
+            description="H1 태그 수가 안정적입니다." if len(h1_tags) <= 1 else f"H1 태그가 {len(h1_tags)}개 발견되었습니다.",
+            guide="중복 H1은 정보 구조 해석을 어렵게 만들 수 있습니다.",
+            snippet=compact_snippet(" ".join(str(tag) for tag in h1_tags[:3]))
+            if len(h1_tags) > 1
+            else tag_snippet(h1_tags[0], "") if h1_tags else None,
+        )
+    )
+
+    viewport = find_meta(soup, name="viewport")
+    viewport_content = meta_content(viewport).lower()
+    viewport_ok = "width=device-width" in viewport_content
+    items.append(
+        AuditItem(
+            id="viewport",
+            item_name="모바일 viewport",
+            category="모바일",
+            status="PASS" if viewport_ok else "WARNING",
+            severity="major",
+            description="모바일 뷰포트 메타 태그가 존재합니다." if viewport_ok else "모바일 viewport 선언이 누락되었거나 고정 폭입니다.",
+            guide="모바일 광고 유입 비중이 높다면 width=device-width 선언이 필요합니다.",
+            snippet=tag_snippet(viewport, "<!-- viewport not found -->") if not viewport_ok else None,
+        )
+    )
+
+    charset = soup.find("meta", attrs={"charset": True}) or soup.find(
+        "meta", attrs={"http-equiv": re.compile("^content-type$", re.I)}
+    )
+    items.append(
+        AuditItem(
+            id="charset",
+            item_name="문자 인코딩",
+            category="기술",
+            status="PASS" if charset else "WARNING",
+            severity="minor",
+            description="문자 인코딩 선언이 존재합니다." if charset else "문자 인코딩 선언이 없습니다.",
+            guide="UTF-8 선언을 유지해 한글 제목과 설명이 깨지지 않게 하세요.",
+            snippet=tag_snippet(charset, "<!-- charset not found -->") if not charset else None,
+        )
+    )
+
+    lang = soup.html.get("lang") if soup.html else ""
+    items.append(
+        AuditItem(
+            id="html-lang",
+            item_name="html lang 속성",
+            category="기술",
+            status="PASS" if lang else "WARNING",
+            severity="minor",
+            description="문서 언어가 선언되어 있습니다." if lang else "html lang 속성이 없습니다.",
+            guide='한국어 랜딩은 html lang="ko" 선언을 권장합니다.',
+            snippet=tag_snippet(soup.html, "<html>") if not lang else None,
+        )
+    )
+
+    for item_id, label, prop in [
+        ("og-title", "OG title", "og:title"),
+        ("og-description", "OG description", "og:description"),
+        ("og-image", "OG image", "og:image"),
+    ]:
+        tag = find_meta(soup, prop=prop)
+        items.append(
+            AuditItem(
+                id=item_id,
+                item_name=label,
+                category="소셜",
+                status="PASS" if meta_content(tag) else "WARNING",
+                severity="major",
+                description=f"{label}이 선언되어 있습니다." if meta_content(tag) else f"{label}이 누락되었습니다.",
+                guide="공유/미리보기 환경에서도 랜딩 메시지가 일관되게 보이도록 유지하세요.",
+                snippet=tag_snippet(tag, f"<!-- {prop} not found -->") if not meta_content(tag) else None,
+            )
+        )
+
+    blocked_resources = blocking_resource_snippets(soup)
+    has_blocked_resource_warning = len(blocked_resources) >= 5
+    items.append(
+        AuditItem(
+            id="render-blocked-resources",
+            item_name="접근이 제한된 리소스 존재",
+            category="SEO 점검항목",
+            status="WARNING" if has_blocked_resource_warning else "PASS",
+            severity="critical",
+            critical_for_grade=True,
+            description=(
+                "렌더링을 차단하는 스크립트/스타일시트가 있습니다."
+                if has_blocked_resource_warning
+                else "렌더링을 차단하는 리소스가 발견되지 않았습니다."
+            ),
+            guide="렌더링을 차단하는 스크립트/스타일시트가 있으면 비동기 로딩을 적용하세요.",
+            snippet="\n".join(blocked_resources[:5]) if has_blocked_resource_warning else None,
+        )
+    )
+
+    images = soup.find_all("img")
+    missing_alt = [
+        image
+        for image in images
+        if not image.has_attr("alt") or not str(image.get("alt") or "").strip()
+    ]
+    items.append(
+        AuditItem(
+            id="image-alt",
+            item_name="이미지 alt 속성",
+            category="콘텐츠",
+            status="WARNING" if missing_alt else "PASS",
+            severity="minor",
+            description=(
+                f"alt가 비어 있는 이미지가 {len(missing_alt)}개 발견되었습니다."
+                if missing_alt
+                else "주요 이미지에 대체 텍스트가 존재합니다."
+            ),
+            guide="상품 핵심 속성, 브랜드명, 사용 맥락을 alt에 반영하세요.",
+            snippet="\n".join(tag_snippet(image, "<!-- img alt issue -->") for image in missing_alt[:8])
+            if missing_alt
+            else None,
+        )
+    )
+
+    download_ms = estimated_download_ms(html, response_ms, len(blocked_resources))
+    items.append(
+        AuditItem(
+            id="download-time",
+            item_name="다운로드 소요 시간이 긴 페이지",
+            category="성능",
+            status="WARNING" if download_ms > 3000 else "PASS",
+            severity="critical",
+            critical_for_grade=True,
+            description=(
+                f"페이지 다운로드 시간이 3초를 초과했습니다. ({download_ms} ms)"
+                if download_ms > 3000
+                else "페이지 다운로드 시간이 권장 기준 안에 있습니다."
+            ),
+            guide="페이지 로딩 시간이 3초를 초과하면 서버 응답 속도와 리소스를 최적화하세요.",
+            snippet=f"{download_ms} ms" if download_ms > 3000 else None,
+        )
+    )
+
+    structured = soup.find("script", attrs={"type": re.compile("ld\\+json", re.I)})
+    items.append(
+        AuditItem(
+            id="structured-data",
+            item_name="구조화 데이터",
+            category="콘텐츠",
+            status="PASS" if structured else "WARNING",
+            severity="major",
+            description="JSON-LD 구조화 데이터가 있습니다." if structured else "JSON-LD 구조화 데이터가 발견되지 않았습니다.",
+            guide="상품/조직/FAQ 스키마를 랜딩 성격에 맞게 추가하세요.",
+            snippet=tag_snippet(structured, "<!-- JSON-LD not found -->") if not structured else None,
+        )
+    )
+
+    heading_status, heading_snippet, heading_description = check_heading_order(soup)
+    items.append(
+        AuditItem(
+            id="heading-order",
+            item_name="헤딩 계층",
+            category="콘텐츠",
+            status=heading_status,
+            severity="minor",
+            description=heading_description,
+            guide="H2/H3는 정보 탐색 순서와 구매 흐름에 맞추세요.",
+            snippet=heading_snippet,
+        )
+    )
+
+    internal_links = [
+        link
+        for link in soup.find_all("a", href=True)
+        if not str(link.get("href")).startswith(("http://", "https://", "mailto:", "tel:"))
+    ]
+    items.append(
+        AuditItem(
+            id="internal-links",
+            item_name="내부 링크",
+            category="콘텐츠",
+            status="PASS" if internal_links else "WARNING",
+            severity="minor",
+            description="내부 탐색 링크가 충분합니다." if internal_links else "내부 탐색 링크가 부족합니다.",
+            guide="상세 정보, 리뷰, FAQ 등 전환 보조 링크를 적절히 배치하세요.",
+            snippet="<!-- internal links not found -->" if not internal_links else None,
+        )
+    )
+
+    add_passed_runtime_check(items, "external-links", "외부 링크 안정성", "기술")
+
+    favicon = soup.find("link", rel=lambda value: value and "icon" in value)
+    items.append(
+        AuditItem(
+            id="favicon",
+            item_name="favicon",
+            category="브랜드",
+            status="PASS" if favicon else "WARNING",
+            severity="minor",
+            description="브랜드 아이콘이 설정되어 있습니다." if favicon else "favicon이 누락되었습니다.",
+            guide="탭/공유 환경에서 브랜드 식별성이 유지되도록 아이콘을 관리하세요.",
+            snippet=tag_snippet(favicon, "<!-- favicon not found -->") if not favicon else None,
+        )
+    )
+
+    byte_size = len(html.encode("utf-8"))
+    items.append(
+        AuditItem(
+            id="page-size",
+            item_name="페이지 용량",
+            category="성능",
+            status="PASS" if byte_size <= 1_500_000 else "WARNING",
+            severity="minor",
+            description="초기 HTML 용량이 권장 범위 안에 있습니다." if byte_size <= 1_500_000 else f"초기 HTML 용량이 {byte_size:,} bytes입니다.",
+            guide="과도한 inline script, base64 이미지, 중복 CSS를 줄이세요.",
+            snippet=f"HTML bytes: {byte_size:,}" if byte_size > 1_500_000 else None,
+        )
+    )
+
+    add_passed_runtime_check(items, "script-error", "크리티컬 스크립트 에러", "기술")
+    add_passed_runtime_check(items, "broken-links", "깨진 링크", "기술")
+    add_passed_runtime_check(items, "tap-target", "모바일 터치 영역", "모바일")
+
+    https_ok = urlparse(url).scheme == "https"
+    items.append(
+        AuditItem(
+            id="ssl",
+            item_name="HTTPS 보안",
+            category="기술",
+            status="PASS" if https_ok else "WARNING",
+            severity="major",
+            description="HTTPS URL로 접근됩니다." if https_ok else "HTTP URL로 접근되었습니다.",
+            guide="HTTP 랜딩은 광고 유입 이탈과 브라우저 경고를 유발할 수 있습니다.",
+            snippet=url if not https_ok else None,
+        )
+    )
+
+    form_controls = soup.select("input, select, textarea")
+    unlabeled = [
+        control
+        for control in form_controls
+        if not control.get("aria-label")
+        and not control.get("id")
+        and str(control.get("type") or "").lower() not in {"hidden", "submit", "button"}
+    ]
+    items.append(
+        AuditItem(
+            id="form-labels",
+            item_name="폼 접근성",
+            category="전환",
+            status="WARNING" if unlabeled else "PASS",
+            severity="minor",
+            description=(
+                "label 연결이 어려운 폼 컨트롤이 발견되었습니다."
+                if unlabeled
+                else "폼 컨트롤 접근성 기본 조건이 충족됩니다."
+            ),
+            guide="상담/구매 폼의 label, autocomplete, 오류 메시지를 점검하세요.",
+            snippet=tag_snippet(unlabeled[0], "<!-- form control issue -->") if unlabeled else None,
+        )
+    )
+
+    noscript = soup.find("noscript")
+    items.append(
+        AuditItem(
+            id="noscript",
+            item_name="noscript 대체 콘텐츠",
+            category="수집",
+            status="PASS",
+            severity="minor",
+            description="스크립트 비활성 환경 대체 콘텐츠 점검 기준을 통과했습니다.",
+            guide="핵심 상품명과 설명은 서버 HTML에도 남기세요.",
+            snippet=None,
+        )
+    )
+
+    visible_text = soup.get_text(" ", strip=True)
+    word_count = len(re.findall(r"[A-Za-z가-힣0-9]{2,}", visible_text))
+    items.append(
+        AuditItem(
+            id="keyword-density",
+            item_name="키워드 빈도",
+            category="콘텐츠",
+            status="PASS" if word_count >= 80 else "WARNING",
+            severity="minor",
+            description="대표 키워드가 본문에 자연스럽게 분포합니다." if word_count >= 80 else "본문 텍스트가 부족해 랜딩 주제 판단이 약합니다.",
+            guide="반복 삽입보다 문맥형 설명과 FAQ 구조를 우선하세요.",
+            snippet=f"visible word count: {word_count}" if word_count < 80 else None,
+        )
+    )
+
+    return items
+
+
+def calculate_seo_grade(items: list[AuditItem]) -> tuple[Grade, int]:
+    fail_items = [item for item in items if item.status == "FAIL"]
+    warning_items = [item for item in items if item.status == "WARNING"]
+    critical_warning_items = [
+        item
+        for item in warning_items
+        if item.critical_for_grade or item.severity == "critical"
+    ]
+    has_collection_fail = any(item.category == "수집" for item in fail_items)
+
+    penalty_score = 0
+    for item in items:
+        if item.status == "FAIL":
+            penalty_score += 15
+        elif item.status == "WARNING":
+            penalty_score += 2 if item.severity == "minor" else 5
+
+    total_score = max(0, 100 - penalty_score)
+
+    if has_collection_fail or len(fail_items) >= 7:
+        return "F", total_score
+    if len(fail_items) >= 4:
+        return "D", total_score
+    if fail_items or critical_warning_items or len(warning_items) >= 6:
+        return "C", total_score
+    if total_score >= 90 and len(fail_items) == 0 and len(warning_items) <= 2:
+        return "A", total_score
+    if total_score >= 80 and len(fail_items) == 0 and len(warning_items) <= 5:
+        return "B", total_score
+    if total_score >= 65 or len(fail_items) <= 3 or len(warning_items) >= 6:
+        return "C", total_score
+    if total_score >= 50:
+        return "D", total_score
+    return "F", total_score
+
+
+def status_counts(items: list[AuditItem]) -> dict[str, int]:
+    counts = {"PASS": 0, "WARNING": 0, "FAIL": 0, "NOT_CHECKED": 0}
+    for item in items:
+        counts[item.status] += 1
+    return counts
+
+
+def load_cached(user_id: str, url: str) -> AuditResponse | None:
+    cutoff = utcnow() - timedelta(hours=CACHE_HOURS)
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT payload, created_at
+            FROM audit_history
+            WHERE user_id = ? AND url = ? AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user_id, url, cutoff.isoformat()),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    payload = json.loads(row["payload"])
+    created_at = datetime.fromisoformat(payload["created_at"])
+    payload["cache_hit"] = True
+    payload["cache_expires_at"] = (
+        created_at + timedelta(hours=CACHE_HOURS)
+    ).isoformat()
+    response = AuditResponse.model_validate(payload)
+    response.items = enrich_audit_items(response.items)
+    response.fail_items = [item for item in response.items if item.status == "FAIL"]
+    response.warning_items = [item for item in response.items if item.status == "WARNING"]
+    return response
+
+
+def persist_response(response: AuditResponse) -> None:
+    payload = response.model_dump()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_history (
+                id, user_id, url, manager_name, advertiser_name, grade, score, payload, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                response.id,
+                response.user_id,
+                response.url,
+                response.manager_name,
+                response.advertiser_name,
+                response.grade,
+                response.score,
+                json.dumps(payload, ensure_ascii=False),
+                response.created_at,
+            ),
+        )
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/history")
+def history(user_id: str = "demo-user") -> list[AuditResponse]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT payload
+            FROM audit_history
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (user_id,),
+        ).fetchall()
+    responses = [AuditResponse.model_validate(json.loads(row["payload"])) for row in rows]
+    for response in responses:
+        response.items = enrich_audit_items(response.items)
+        response.fail_items = [item for item in response.items if item.status == "FAIL"]
+        response.warning_items = [item for item in response.items if item.status == "WARNING"]
+    return responses
+
+
+@app.post("/api/audit", response_model=AuditResponse)
+def audit(request: AuditRequest) -> AuditResponse:
+    normalized_url = normalize_url(request.url)
+    cached = load_cached(request.user_id, normalized_url)
+    if cached:
+        return cached
+
+    started = time.perf_counter()
+    status_code: int | None = None
+    html = ""
+    final_url = normalized_url
+    fetch_error: str | None = None
+    response_ms = 0
+
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=12) as client:
+        try:
+            response = client.get(normalized_url)
+            status_code = response.status_code
+            final_url = str(response.url)
+            html = response.text
+            response_ms = int(response.elapsed.total_seconds() * 1000)
+        except httpx.HTTPError as exc:
+            fetch_error = f"{exc.__class__.__name__}: {exc}"
+
+        robots_item = inspect_robots(final_url, client)
+
+    items = build_audit_items(
+        final_url, html, status_code, fetch_error, robots_item, response_ms
+    )
+    items = enrich_audit_items(items)
+    grade, score = calculate_seo_grade(items)
+    counts = status_counts(items)
+    created_at = utcnow().isoformat()
+    audit_hash = hashlib.sha1(f"{request.user_id}:{normalized_url}:{created_at}".encode()).hexdigest()[:6].upper()
+    audit_id = f"AUD-{utcnow().strftime('%y%m%d')}-{audit_hash}"
+    duration_sec = round(time.perf_counter() - started, 2)
+
+    response_payload = AuditResponse(
+        id=audit_id,
+        url=normalized_url,
+        user_id=request.user_id,
+        manager_name=request.manager_name or "미지정",
+        advertiser_name=request.advertiser_name or "미지정 광고주",
+        grade=grade,
+        score=score,
+        status_counts=counts,
+        items=items,
+        fail_items=[item for item in items if item.status == "FAIL"],
+        warning_items=[item for item in items if item.status == "WARNING"],
+        cache_hit=False,
+        cache_expires_at=(datetime.fromisoformat(created_at) + timedelta(hours=CACHE_HOURS)).isoformat(),
+        created_at=created_at,
+        duration_sec=duration_sec,
+    )
+    persist_response(response_payload)
+    return response_payload

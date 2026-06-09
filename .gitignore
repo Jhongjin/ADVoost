@@ -1,0 +1,17 @@
+.next/
+node_modules/
+__pycache__/
+*.pyc
+*.sqlite3
+*.db
+.env
+.env.local
+*.log
+tsconfig.tsbuildinfo
+.edge-cdp-profile/
+.playwright-mcp/
+.vercel/
+*.png
+*.jpg
+*.jpeg
+*.pdf
