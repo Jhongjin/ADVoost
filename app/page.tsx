@@ -341,6 +341,16 @@ function serializeRecordForReport(record: AuditRecord) {
   };
 }
 
+function recordHasReportData(record: AuditRecord) {
+  const hasKeywords = Boolean(
+    record.keywordSummary?.singleRows.length || record.keywordSummary?.phraseRows.length,
+  );
+  const hasSnapshot = Boolean(
+    record.renderSnapshot?.desktopScreenshot || record.renderSnapshot?.mobileScreenshot,
+  );
+  return record.items.length > 0 && hasKeywords && hasSnapshot;
+}
+
 function estimatePdfMinutes(count: number, mode: PdfMode) {
   return Math.max(1, Math.ceil(count * (mode === "premium" ? 2.5 : 1.2)));
 }
@@ -574,6 +584,48 @@ export default function Home() {
     setActiveView("detail");
   }
 
+  async function prepareRecordsForPdf(targets: AuditRecord[]) {
+    const prepared: AuditRecord[] = [];
+    const refreshed: AuditRecord[] = [];
+
+    for (const record of targets) {
+      if (recordHasReportData(record)) {
+        prepared.push(record);
+        continue;
+      }
+
+      const nextRecord = await requestAudit({
+        url: normalizeUrl(record.url),
+        managerName: record.managerName,
+        advertiserName: record.advertiserName,
+      });
+      prepared.push(nextRecord);
+      refreshed.push(nextRecord);
+    }
+
+    if (refreshed.length > 0) {
+      setRecords((current) => {
+        const refreshedUrls = new Set(
+          refreshed.map((record) => normalizeUrl(record.url)),
+        );
+        return [
+          ...refreshed,
+          ...current.filter(
+            (record) => !refreshedUrls.has(normalizeUrl(record.url)),
+          ),
+        ];
+      });
+      setDetailRecord((current) => {
+        const replacement = refreshed.find(
+          (record) => normalizeUrl(record.url) === normalizeUrl(current.url),
+        );
+        return replacement ?? current;
+      });
+    }
+
+    return prepared;
+  }
+
   function openPdfDialog(
     targetRecords: AuditRecord | AuditRecord[],
     mode: PdfMode,
@@ -604,12 +656,13 @@ export default function Home() {
     if (!pdfDialog) {
       return;
     }
+    const dialogState = pdfDialog;
     const jobId = `PDF-${Date.now()}`;
     const nextJob: PdfJob = {
       id: jobId,
-      mode: pdfDialog.mode,
-      platform: pdfDialog.platform,
-      records: pdfDialog.records,
+      mode: dialogState.mode,
+      platform: dialogState.platform,
+      records: dialogState.records,
       status: "building",
       createdAt: new Date().toISOString(),
     };
@@ -618,20 +671,36 @@ export default function Home() {
     showToast({
       tone: "info",
       title: "PDF 생성 요청",
-      message: `${pdfDialog.records.length}개 리포트 생성을 시작했습니다.`,
+      message: `${dialogState.records.length}개 리포트 생성을 시작했습니다.`,
     });
 
     try {
+      const missingDataCount = dialogState.records.filter(
+        (record) => !recordHasReportData(record),
+      ).length;
+      const reportRecords =
+        missingDataCount > 0
+          ? await prepareRecordsForPdf(dialogState.records)
+          : dialogState.records;
+
+      if (missingDataCount > 0) {
+        setPdfJobs((current) =>
+          current.map((job) =>
+            job.id === jobId ? { ...job, records: reportRecords } : job,
+          ),
+        );
+      }
+
       const response = await fetch(`${API_BASE_URL}/api/reports/pdf`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          records: pdfDialog.records.map(serializeRecordForReport),
-          report_type: pdfDialog.mode,
-          platform: pdfDialog.platform,
-          bundle: pdfDialog.bundle,
+          records: reportRecords.map(serializeRecordForReport),
+          report_type: dialogState.mode,
+          platform: dialogState.platform,
+          bundle: dialogState.bundle,
         }),
       });
 
@@ -651,7 +720,7 @@ export default function Home() {
       const objectUrl = URL.createObjectURL(blob);
       const filename =
         parseDownloadFilename(response.headers.get("Content-Disposition")) ??
-        defaultPdfFilename(pdfDialog.records, pdfDialog.mode, pdfDialog.bundle);
+        defaultPdfFilename(reportRecords, dialogState.mode, dialogState.bundle);
       setPdfJobs((current) =>
         current.map((job) =>
           job.id === jobId

@@ -2366,11 +2366,12 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       justify-content: space-between;
       align-items: center;
       padding-bottom: 18px;
+      margin-bottom: 28px;
       border-bottom: 1px solid #dbe3eb;
     }}
     .brand strong {{ color: #3346a3; font-size: 20px; }}
     .brand b {{ font-size: 20px; }}
-    h1 {{ margin: 30px 0 12px; font-size: 27px; line-height: 1.24; }}
+    h1 {{ margin: 0 0 18px; font-size: 27px; line-height: 1.24; }}
     h2 {{ margin: 0 0 14px; font-size: 20px; line-height: 1.25; }}
     h3 {{ margin: 17px 0 10px; font-size: 15px; }}
     p {{ margin: 0 0 8px; color: #536276; }}
