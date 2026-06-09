@@ -22,6 +22,7 @@ import {
   LogOut,
   MessageSquare,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Trash2,
@@ -57,11 +58,42 @@ type ToastState = {
   message: string;
 };
 
+type PdfMode = "standard" | "premium";
+type PdfPlatform = "카페24" | "고도몰" | "아임웹" | "워드프레스" | "자체개발";
+type PdfJobStatus = "building" | "ready" | "failed";
+
+type PdfJob = {
+  id: string;
+  mode: PdfMode;
+  platform: PdfPlatform;
+  records: AuditRecord[];
+  status: PdfJobStatus;
+  createdAt: string;
+  completedAt?: string;
+  objectUrl?: string;
+  filename?: string;
+  error?: string;
+};
+
+type PdfDialogState = {
+  mode: PdfMode;
+  platform: PdfPlatform;
+  records: AuditRecord[];
+  bundle: boolean;
+};
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_AUDIT_API_URL ?? "http://localhost:8000";
 const UNLIMITED_CREDITS = "∞";
 const JOB_POLL_INTERVAL_MS = 1500;
 const JOB_MAX_POLLS = 120;
+const PDF_PLATFORMS: PdfPlatform[] = [
+  "카페24",
+  "고도몰",
+  "아임웹",
+  "워드프레스",
+  "자체개발",
+];
 
 const navItems: Array<{
   key: ViewKey;
@@ -89,7 +121,9 @@ function downloadTextFile(filename: string, content: string, type: string) {
   const link = document.createElement("a");
   link.href = url;
   link.download = filename;
+  document.body.appendChild(link);
   link.click();
+  link.remove();
   URL.revokeObjectURL(url);
 }
 
@@ -258,6 +292,46 @@ async function requestAudit(recordInput: {
   throw new Error("Audit job timed out.");
 }
 
+function parseDownloadFilename(header: string | null) {
+  if (!header) {
+    return null;
+  }
+  const encoded = header.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    return decodeURIComponent(encoded);
+  }
+  return header.match(/filename="?([^";]+)"?/i)?.[1] ?? null;
+}
+
+function defaultPdfFilename(records: AuditRecord[], mode: PdfMode, bundle: boolean) {
+  const firstHost = getDisplayHost(records[0]?.url ?? "report").replace(/[\\/:*?"<>|]/g, "_");
+  if (bundle || records.length > 1) {
+    return mode === "premium" ? "프리미엄_진단보고서_일괄.zip" : "진단보고서_일괄.zip";
+  }
+  return `${mode === "premium" ? "프리미엄_진단보고서" : "진단보고서"}_${firstHost}.pdf`;
+}
+
+function serializeRecordForReport(record: AuditRecord) {
+  return {
+    id: record.id,
+    url: record.url,
+    managerName: record.managerName,
+    advertiserName: record.advertiserName,
+    grade: record.grade,
+    score: record.score,
+    createdAt: record.createdAt,
+    durationSec: record.durationSec,
+    status: record.status,
+    items: record.items,
+    keywordSummary: record.keywordSummary,
+    renderSnapshot: record.renderSnapshot,
+  };
+}
+
+function estimatePdfMinutes(count: number, mode: PdfMode) {
+  return Math.max(1, Math.ceil(count * (mode === "premium" ? 2.5 : 1.2)));
+}
+
 function MetricCard({
   icon,
   label,
@@ -292,10 +366,9 @@ export default function Home() {
   const [singleRunning, setSingleRunning] = useState(false);
   const [singleProgress, setSingleProgress] = useState(0);
   const [toast, setToast] = useState<ToastState | null>(null);
-  const [pdfBanner, setPdfBanner] = useState<{
-    status: "building" | "ready";
-    ids: string[];
-  } | null>(null);
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<string[]>([]);
+  const [pdfJobs, setPdfJobs] = useState<PdfJob[]>([]);
+  const [pdfDialog, setPdfDialog] = useState<PdfDialogState | null>(null);
   const [singleForm, setSingleForm] = useState({
     url: "",
     managerName: "",
@@ -376,6 +449,14 @@ export default function Home() {
       });
     return [...directRows, ...fillers];
   }, [records, visibleManagedUrls]);
+  const selectedHistoryRows = useMemo(
+    () => historyRows.filter((record) => selectedHistoryIds.includes(record.id)),
+    [historyRows, selectedHistoryIds],
+  );
+  const readyPdfJobs = useMemo(
+    () => pdfJobs.filter((job) => job.status === "ready"),
+    [pdfJobs],
+  );
 
   function showToast(nextToast: ToastState) {
     setToast(nextToast);
@@ -387,27 +468,144 @@ export default function Home() {
     setActiveView("detail");
   }
 
-  function handleCreatePdf(targetRecords: AuditRecord | AuditRecord[]) {
+  function openPdfDialog(
+    targetRecords: AuditRecord | AuditRecord[],
+    mode: PdfMode,
+    bundle = false,
+  ) {
     const targets = Array.isArray(targetRecords) ? targetRecords : [targetRecords];
-    setPdfBanner({ status: "building", ids: targets.map((record) => record.id) });
-    window.setTimeout(() => {
-      setPdfBanner({ status: "ready", ids: targets.map((record) => record.id) });
+    if (targets.length === 0) {
       showToast({
-        tone: "success",
-        title: "PDF ZIP 준비 완료",
-        message: `${targets.length}개 리포트를 다운로드할 수 있습니다.`,
+        tone: "warning",
+        title: "선택 URL 없음",
+        message: "PDF로 내보낼 분석 내역을 먼저 선택하세요.",
       });
-    }, 1100);
+      return;
+    }
+    setPdfDialog({
+      mode,
+      platform: "카페24",
+      records: targets,
+      bundle,
+    });
   }
 
-  function downloadPdfArchive() {
-    const ids = pdfBanner?.ids ?? [];
-    downloadTextFile(
-      "advoost-report-archive.txt",
-      `ADVoost PDF ZIP mock\n${ids.join("\n")}`,
-      "text/plain;charset=utf-8",
+  function openHistoryPdfDialog(mode: PdfMode) {
+    openPdfDialog(selectedHistoryRows, mode, true);
+  }
+
+  async function submitPdfDialog() {
+    if (!pdfDialog) {
+      return;
+    }
+    const jobId = `PDF-${Date.now()}`;
+    const nextJob: PdfJob = {
+      id: jobId,
+      mode: pdfDialog.mode,
+      platform: pdfDialog.platform,
+      records: pdfDialog.records,
+      status: "building",
+      createdAt: new Date().toISOString(),
+    };
+    setPdfJobs((current) => [nextJob, ...current]);
+    setPdfDialog(null);
+    showToast({
+      tone: "info",
+      title: "PDF 생성 요청",
+      message: `${pdfDialog.records.length}개 리포트 생성을 시작했습니다.`,
+    });
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/reports/pdf`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          records: pdfDialog.records.map(serializeRecordForReport),
+          report_type: pdfDialog.mode,
+          platform: pdfDialog.platform,
+          bundle: pdfDialog.bundle,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`PDF API failed: ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const filename =
+        parseDownloadFilename(response.headers.get("Content-Disposition")) ??
+        defaultPdfFilename(pdfDialog.records, pdfDialog.mode, pdfDialog.bundle);
+      setPdfJobs((current) =>
+        current.map((job) =>
+          job.id === jobId
+            ? {
+                ...job,
+                status: "ready",
+                completedAt: new Date().toISOString(),
+                objectUrl,
+                filename,
+              }
+            : job,
+        ),
+      );
+      showToast({
+        tone: "success",
+        title: "PDF 준비 완료",
+        message: `${filename} 파일을 다운로드할 수 있습니다.`,
+      });
+    } catch (error) {
+      setPdfJobs((current) =>
+        current.map((job) =>
+          job.id === jobId
+            ? {
+                ...job,
+                status: "failed",
+                completedAt: new Date().toISOString(),
+                error: error instanceof Error ? error.message : "PDF 생성 실패",
+              }
+            : job,
+        ),
+      );
+      showToast({
+        tone: "warning",
+        title: "PDF 생성 실패",
+        message: "백엔드 PDF 렌더러 상태를 확인하세요.",
+      });
+    }
+  }
+
+  function downloadPdfJob(job: PdfJob) {
+    if (!job.objectUrl) {
+      showToast({
+        tone: "warning",
+        title: "파일 준비 중",
+        message: "PDF 생성이 완료된 뒤 다시 시도하세요.",
+      });
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = job.objectUrl;
+    link.download = job.filename ?? defaultPdfFilename(job.records, job.mode, job.records.length > 1);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function toggleHistorySelection(recordId: string) {
+    setSelectedHistoryIds((current) =>
+      current.includes(recordId)
+        ? current.filter((id) => id !== recordId)
+        : [...current, recordId],
     );
-    setPdfBanner(null);
+  }
+
+  function toggleAllHistoryRows() {
+    const rowIds = historyRows.map((record) => record.id);
+    const allSelected = rowIds.every((id) => selectedHistoryIds.includes(id));
+    setSelectedHistoryIds(allSelected ? [] : rowIds);
   }
 
   function handleSupport(record: AuditRecord) {
@@ -736,7 +934,7 @@ export default function Home() {
           record={detailRecord}
           onBack={() => setActiveView("history")}
           onSupport={handleSupport}
-          onCreatePdf={handleCreatePdf}
+          onCreatePdf={(record, mode) => openPdfDialog(record, mode, false)}
         />
       );
     }
@@ -855,13 +1053,19 @@ export default function Home() {
                 <FileDown size={16} />
                 분석 다운로드
               </button>
-              <span className="ready-chip">2건 준비됨</span>
+              {selectedHistoryRows.length > 0 ? (
+                <span className="selected-chip">{selectedHistoryRows.length}개 선택됨</span>
+              ) : null}
+              {readyPdfJobs.length > 0 ? (
+                <span className="ready-chip">{readyPdfJobs.length}건 준비됨</span>
+              ) : null}
               <ChevronDown size={15} />
               <div className="download-spacer" />
               <button
                 className="secondary-button muted-action"
                 type="button"
-                onClick={() => handleCreatePdf(historyRows.slice(0, 2))}
+                disabled={selectedHistoryRows.length === 0}
+                onClick={() => openHistoryPdfDialog("standard")}
               >
                 <FileArchive size={16} />
                 PDF보고서 일괄 다운로드
@@ -869,7 +1073,8 @@ export default function Home() {
               <button
                 className="secondary-button premium-action"
                 type="button"
-                onClick={() => handleCreatePdf(historyRows.slice(0, 2))}
+                disabled={selectedHistoryRows.length === 0}
+                onClick={() => openHistoryPdfDialog("premium")}
               >
                 <FileArchive size={16} />
                 프리미엄 PDF 일괄 다운로드
@@ -877,19 +1082,85 @@ export default function Home() {
               <button
                 className="text-button subdued"
                 type="button"
-                onClick={handleExcelExport}
+                onClick={() => setSelectedHistoryIds([])}
               >
                 선택 해제
               </button>
             </div>
             <div className="premium-row">
-              <FileArchive size={16} />
-              프리미엄 PDF 다운로드
-              <ChevronDown size={15} />
+              <div className="premium-row-title">
+                <FileArchive size={16} />
+                프리미엄 PDF 다운로드
+                {readyPdfJobs.length > 0 ? (
+                  <span className="ready-chip">{readyPdfJobs.length}건 준비됨</span>
+                ) : null}
+              </div>
+              <button
+                className="text-button dark"
+                type="button"
+                onClick={() =>
+                  showToast({
+                    tone: "info",
+                    title: "목록 새로고침",
+                    message: "현재 브라우저 세션의 PDF 작업 목록을 표시 중입니다.",
+                  })
+                }
+              >
+                <RefreshCw size={16} />
+                새로고침
+              </button>
+            </div>
+            <div className="pdf-job-list">
+              {pdfJobs.length === 0 ? (
+                <div className="pdf-job-empty">완료 후 3일간 보관</div>
+              ) : (
+                pdfJobs.map((job) => (
+                  <div className={`pdf-job-row job-${job.status}`} key={job.id}>
+                    <span className={`pdf-job-status status-${job.status}`}>
+                      {job.status === "building"
+                        ? "대기 중"
+                        : job.status === "ready"
+                          ? "완료"
+                          : "실패"}
+                    </span>
+                    <span>{formatHistoryDate(job.createdAt)}</span>
+                    <strong>{job.records.length}건</strong>
+                    <span>{job.mode === "premium" ? job.platform : "일반 PDF"}</span>
+                    <span>
+                      {job.status === "ready" && job.completedAt
+                        ? `완료: ${formatHistoryDate(job.completedAt)}`
+                        : job.status === "failed"
+                          ? job.error ?? "생성 실패"
+                          : "처리 중"}
+                    </span>
+                    {job.status === "ready" ? (
+                      <button type="button" onClick={() => downloadPdfJob(job)}>
+                        <Download size={15} />
+                        다운로드
+                      </button>
+                    ) : job.status === "failed" ? (
+                      <span className="pdf-job-failed">실패</span>
+                    ) : (
+                      <span className="pdf-job-spinner">처리 중</span>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
             <div className="history-table">
               <div className="history-table-row history-table-head">
-                <span />
+                <span>
+                  <input
+                    type="checkbox"
+                    checked={
+                      historyRows.length > 0 &&
+                      historyRows.every((record) =>
+                        selectedHistoryIds.includes(record.id),
+                      )
+                    }
+                    onChange={toggleAllHistoryRows}
+                  />
+                </span>
                 <span>URL</span>
                 <span>상태</span>
                 <span>등급</span>
@@ -902,7 +1173,11 @@ export default function Home() {
               {historyRows.map((record, index) => (
                 <div className="history-table-row" key={`${record.id}-${index}`}>
                   <span>
-                    <input type="checkbox" />
+                    <input
+                      type="checkbox"
+                      checked={selectedHistoryIds.includes(record.id)}
+                      onChange={() => toggleHistorySelection(record.id)}
+                    />
                   </span>
                   <span className="history-url-cell">
                     <strong>{record.url}</strong>
@@ -1355,27 +1630,93 @@ export default function Home() {
 
       <div className="workspace">
         <div className="workspace-inner">
-          {pdfBanner ? (
-            <div className={`async-banner banner-${pdfBanner.status}`}>
-              <div>
-                <FileArchive size={18} />
-                <span>
-                  {pdfBanner.status === "building"
-                    ? `${pdfBanner.ids.length}개 PDF 생성 중`
-                    : `${pdfBanner.ids.length}개 PDF ZIP 다운로드 준비 완료`}
-                </span>
-              </div>
-              {pdfBanner.status === "ready" ? (
-                <button type="button" onClick={downloadPdfArchive}>
-                  다운로드
-                </button>
-              ) : null}
-            </div>
-          ) : null}
-
           {content}
         </div>
       </div>
+
+      {pdfDialog ? (
+        <div className="modal-scrim pdf-modal-scrim" role="dialog" aria-modal="true">
+          <div className="pdf-modal-panel">
+            <button
+              className="pdf-modal-close"
+              type="button"
+              aria-label="닫기"
+              onClick={() => setPdfDialog(null)}
+            >
+              ×
+            </button>
+            {pdfDialog.mode === "premium" ? (
+              <>
+                <h2>플랫폼 선택 — 프리미엄 PDF {pdfDialog.bundle ? "일괄 다운로드" : "다운로드"}</h2>
+                <p>
+                  사용 중인 쇼핑몰/CMS 플랫폼을 선택해 주세요.
+                  <br />
+                  선택한 플랫폼의 수정 가이드가 PDF에 포함됩니다.
+                </p>
+                <div className="platform-grid">
+                  {PDF_PLATFORMS.map((platform) => (
+                    <button
+                      className={pdfDialog.platform === platform ? "active" : ""}
+                      type="button"
+                      key={platform}
+                      onClick={() =>
+                        setPdfDialog((current) =>
+                          current ? { ...current, platform } : current,
+                        )
+                      }
+                    >
+                      {platform}
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <h2>PDF 보고서 {pdfDialog.bundle ? "일괄 다운로드" : "다운로드"}</h2>
+                <p>
+                  선택한 분석 결과를 PDF 보고서로 생성합니다. 완료 후 다운로드
+                  목록에서 파일을 받을 수 있습니다.
+                </p>
+              </>
+            )}
+            <div className="pdf-modal-summary">
+              <span>
+                대상 URL: <strong>{pdfDialog.records.length}개</strong>
+              </span>
+              <span>
+                예상 처리시간:{" "}
+                <strong>
+                  {estimatePdfMinutes(pdfDialog.records.length, pdfDialog.mode)}분
+                </strong>
+              </span>
+              <span>
+                내부 플랫폼: <strong>크레딧 차감 없음</strong>
+              </span>
+            </div>
+            <label className="pdf-modal-checkbox">
+              <input type="checkbox" />
+              다시 열지 않기
+            </label>
+            <div className="pdf-modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setPdfDialog(null)}
+              >
+                취소
+              </button>
+              <button className="primary-button" type="button" onClick={submitPdfDialog}>
+                <FileArchive size={17} />
+                {pdfDialog.mode === "premium"
+                  ? pdfDialog.bundle
+                    ? "일괄 다운로드 요청"
+                    : "다운로드 요청"
+                  : "확인"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className={`toast toast-${toast.tone}`}>

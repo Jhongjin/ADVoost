@@ -37,7 +37,7 @@ interface ReportDetailProps {
   record: AuditRecord;
   onBack: () => void;
   onSupport: (record: AuditRecord) => void;
-  onCreatePdf: (record: AuditRecord) => void;
+  onCreatePdf: (record: AuditRecord, mode: "standard" | "premium") => void;
 }
 
 const gradeClass: Record<AuditRecord["grade"], string> = {
@@ -362,7 +362,7 @@ export default function ReportDetail({
               className="secondary-button"
               type="button"
               title="PDF 다운로드"
-              onClick={() => onCreatePdf(record)}
+              onClick={() => onCreatePdf(record, "standard")}
             >
               <FileText size={16} />
               PDF 다운로드
@@ -371,7 +371,7 @@ export default function ReportDetail({
               className="secondary-button premium-action"
               type="button"
               title="프리미엄 PDF"
-              onClick={() => onCreatePdf(record)}
+              onClick={() => onCreatePdf(record, "premium")}
             >
               <FileText size={16} />
               프리미엄 PDF

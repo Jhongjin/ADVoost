@@ -7,18 +7,21 @@ import re
 import sqlite3
 import time
 import base64
+import io
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from threading import Lock
 from typing import Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -36,6 +39,7 @@ Status = Literal["PASS", "WARNING", "FAIL", "NOT_CHECKED"]
 Severity = Literal["critical", "major", "minor", "info"]
 Grade = Literal["A", "B", "C", "D", "F"]
 JobStatus = Literal["queued", "running", "completed", "failed"]
+ReportType = Literal["standard", "premium"]
 
 DB_PATH = Path(__file__).with_name("advoost.sqlite3")
 CACHE_HOURS = 72
@@ -135,6 +139,13 @@ class AuditJobResponse(BaseModel):
     error: str | None = None
 
 
+class ReportExportRequest(BaseModel):
+    records: list[dict] = Field(..., min_length=1)
+    report_type: ReportType = "standard"
+    platform: str = "자체개발"
+    bundle: bool = False
+
+
 app = FastAPI(
     title="ADVoost SEO Audit Clone API",
     version="0.1.0",
@@ -157,6 +168,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -1575,3 +1587,440 @@ def audit_job(job_id: str) -> AuditJobResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Audit job not found.")
     return job
+
+
+def report_text(value: object, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    return text if text else fallback
+
+
+def report_host(raw_url: str) -> str:
+    try:
+        return urlparse(raw_url).netloc.replace("www.", "") or raw_url
+    except Exception:
+        return raw_url.replace("https://", "").replace("http://", "").split("/")[0]
+
+
+def report_filename(record: dict, report_type: ReportType, extension: str = "pdf") -> str:
+    host = re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", report_host(report_text(record.get("url"))))
+    prefix = "프리미엄_진단보고서" if report_type == "premium" else "진단보고서"
+    return f"{prefix}_{host}.{extension}"
+
+
+def report_status_counts(record: dict) -> dict[str, int]:
+    counts = {"PASS": 0, "WARNING": 0, "FAIL": 0, "NOT_CHECKED": 0}
+    for item in record.get("items", []):
+        status = report_text(item.get("status"), "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def report_status_label(status: str) -> str:
+    return {
+        "PASS": "통과",
+        "WARNING": "경고",
+        "FAIL": "실패",
+        "NOT_CHECKED": "점검불가",
+    }.get(status, status)
+
+
+def report_grade_message(grade: str) -> str:
+    return {
+        "A": "즉시 광고 집행 가능한 최적화 상태입니다.",
+        "B": "전반적으로 양호하나 일부 마이너 항목 보완이 필요합니다.",
+        "C": "개선이 필요합니다. 수집은 가능하나 광고 효율 저하 가능성이 있습니다.",
+        "D": "검색 봇이 사이트 정보를 오독할 가능성이 큽니다.",
+        "F": "수집 실패 또는 인덱싱 불가 위험이 큰 상태입니다.",
+    }.get(grade, "개선 항목을 확인하세요.")
+
+
+def platform_guide(platform: str) -> list[tuple[str, str]]:
+    guides: dict[str, list[tuple[str, str]]] = {
+        "카페24": [
+            ("상품/게시판 스킨의 title 변수 확인", "대표 상품명과 브랜드명이 빈 title로 렌더링되지 않도록 스킨 변수를 점검하세요."),
+            ("이미지 alt 일괄 보정", "상품 이미지 관리 화면에서 대체 텍스트를 상품명 또는 카테고리명 기반으로 입력하세요."),
+            ("앱/외부 스크립트 지연 로딩", "전환 측정 스크립트 외 위젯은 defer 또는 비동기 로딩으로 분리하세요."),
+        ],
+        "고도몰": [
+            ("SEO 기본 설정 확인", "관리자 환경설정의 검색엔진 최적화 항목에서 제목/설명 템플릿을 설정하세요."),
+            ("모바일 스킨 동기화", "PC 스킨과 모바일 스킨의 메타 태그가 서로 다르게 출력되지 않는지 확인하세요."),
+            ("이미지 용량 최적화", "상세페이지 이미지 업로드 전 WebP 변환과 폭 제한을 적용하세요."),
+        ],
+        "아임웹": [
+            ("페이지 SEO 설정", "각 페이지 설정의 검색 노출 제목과 설명이 비어 있지 않은지 확인하세요."),
+            ("섹션 이미지 대체 텍스트", "이미지 위젯의 설명 값을 비워두지 말고 핵심 키워드를 자연스럽게 포함하세요."),
+            ("외부 코드 삽입 최소화", "헤더 공통 코드에 삽입된 추적/채팅 스크립트 수를 정리하세요."),
+        ],
+        "워드프레스": [
+            ("SEO 플러그인 메타 검증", "Yoast, Rank Math 등에서 title/description 템플릿 충돌을 확인하세요."),
+            ("캐시/이미지 최적화", "캐시 플러그인, lazy loading, WebP 변환을 함께 적용하세요."),
+            ("구조화 데이터 중복 제거", "테마와 플러그인이 Schema.org를 중복 출력하지 않는지 점검하세요."),
+        ],
+        "자체개발": [
+            ("서버 렌더 HTML 보장", "검색 봇이 초기 HTML에서 title, description, H1, 핵심 본문을 확인할 수 있어야 합니다."),
+            ("렌더 차단 리소스 점검", "중요 CSS/JS 실패가 검색 봇과 사용자 렌더링을 방해하지 않도록 모니터링하세요."),
+            ("배포 전 Lighthouse/크롤러 점검", "릴리즈 파이프라인에 SEO 태그와 성능 기준 검사를 포함하세요."),
+        ],
+    }
+    return guides.get(platform, guides["자체개발"])
+
+
+def keyword_table_html(record: dict, key: str, title: str) -> str:
+    summary = record.get("keywordSummary") or {}
+    rows = summary.get(key) or []
+    if not rows:
+        return "<p class='empty'>키워드 데이터가 없습니다.</p>"
+    body = []
+    for index, row in enumerate(rows[:30], start=1):
+        title_mark = "통과" if row.get("titleOk") else "미포함"
+        desc_mark = "통과" if row.get("descOk") else "미포함"
+        body.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><strong>{escape(report_text(row.get('keyword')))}</strong></td>"
+            f"<td>{escape(report_text(row.get('frequency')))}</td>"
+            f"<td>{escape(report_text(row.get('ratio')))}</td>"
+            f"<td>{title_mark}</td>"
+            f"<td>{desc_mark}</td>"
+            "</tr>"
+        )
+    return (
+        f"<h3>{escape(title)}</h3>"
+        "<table><thead><tr><th>#</th><th>키워드</th><th>빈도수</th><th>비율</th><th>타이틀</th><th>메타 설명</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table>"
+    )
+
+
+def issue_rows_html(record: dict, premium: bool) -> str:
+    rows = []
+    for item in record.get("items", []):
+        status = report_text(item.get("status"), "")
+        if not premium and status == "PASS":
+            continue
+        name = escape(report_text(item.get("itemName")))
+        detected = escape(report_text(item.get("detectedValue") or item.get("description")))
+        guide = escape(report_text(item.get("remediation") or item.get("guide") or item.get("description")))
+        snippet = escape(report_text(item.get("snippet"), ""))
+        rows.append(
+            "<tr>"
+            f"<td><span class='status status-{status.lower().replace('_', '-')}'>{report_status_label(status)}</span></td>"
+            f"<td><strong>{name}</strong><small>{escape(report_text(item.get('category')))}</small></td>"
+            f"<td>{detected}</td>"
+            f"<td>{guide}</td>"
+            "</tr>"
+        )
+        if premium and snippet:
+            rows.append(
+                "<tr class='snippet-row'><td></td><td colspan='3'>"
+                f"<pre>{snippet}</pre>"
+                "</td></tr>"
+            )
+    if not rows:
+        rows.append("<tr><td colspan='4'>개선이 필요한 항목이 없습니다.</td></tr>")
+    return (
+        "<table><thead><tr><th>상태</th><th>항목</th><th>감지값</th><th>개선 안내</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def build_report_html(record: dict, report_type: ReportType, platform: str) -> str:
+    premium = report_type == "premium"
+    counts = report_status_counts(record)
+    url = report_text(record.get("url"))
+    host = report_host(url)
+    grade = report_text(record.get("grade"), "C")
+    score = report_text(record.get("score"), "0")
+    created_at = report_text(record.get("createdAt"))
+    snapshot = record.get("renderSnapshot") or {}
+    desktop = report_text(snapshot.get("desktopScreenshot"), "")
+    mobile = report_text(snapshot.get("mobileScreenshot"), "")
+    issue_count = counts["WARNING"] + counts["FAIL"]
+    guide_items = "".join(
+        f"<li><strong>{escape(title)}</strong><span>{escape(copy)}</span></li>"
+        for title, copy in platform_guide(platform)
+    )
+    desktop_html = (
+        f'<img src="{escape(desktop, quote=True)}" />'
+        if desktop
+        else "<span>데스크톱 캡처 없음</span>"
+    )
+    mobile_html = (
+        f'<img src="{escape(mobile, quote=True)}" />'
+        if mobile
+        else "<span>모바일 캡처 없음</span>"
+    )
+    device_html = (
+        "<div class='devices'>"
+        f"<div class='desktop'>{desktop_html}</div>"
+        f"<div class='mobile'>{mobile_html}</div>"
+        "</div>"
+    )
+    premium_sections = ""
+    if premium:
+        premium_sections = f"""
+        <section class="page-break">
+          <h2>프리미엄 플랫폼 수정 가이드</h2>
+          <p class="muted">선택 플랫폼: <strong>{escape(platform)}</strong></p>
+          <ul class="guide-list">{guide_items}</ul>
+        </section>
+        <section class="page-break">
+          <h2>키워드 요약</h2>
+          {keyword_table_html(record, "singleRows", "개별 키워드")}
+          {keyword_table_html(record, "phraseRows", "프레이즈 키워드")}
+        </section>
+        <section class="page-break">
+          <h2>전체 점검 세부 내역</h2>
+          {issue_rows_html(record, premium=True)}
+        </section>
+        """
+    else:
+        premium_sections = f"""
+        <section class="page-break">
+          <h2>개선 필요 항목</h2>
+          {issue_rows_html(record, premium=False)}
+        </section>
+        """
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page {{ size: A4; margin: 17mm 15mm; }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: #06132a;
+      background: #fff;
+      font-family: "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.65;
+    }}
+    section {{ margin-bottom: 20px; }}
+    .page-break {{ break-before: page; }}
+    .brand {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 18px;
+      border-bottom: 1px solid #dbe3eb;
+    }}
+    .brand strong {{ color: #3346a3; font-size: 20px; }}
+    .brand b {{ font-size: 20px; }}
+    h1 {{ margin: 32px 0 12px; font-size: 28px; line-height: 1.25; }}
+    h2 {{ margin: 0 0 14px; font-size: 21px; }}
+    h3 {{ margin: 18px 0 10px; font-size: 16px; }}
+    p {{ margin: 0 0 8px; color: #536276; }}
+    .warning-copy {{ margin-top: 18px; color: #f00000; font-weight: 700; }}
+    .overview {{
+      display: grid;
+      grid-template-columns: 0.9fr 1.1fr;
+      gap: 24px;
+      align-items: center;
+      margin-top: 26px;
+    }}
+    .grade-circle {{
+      display: grid;
+      place-items: center;
+      width: 178px;
+      height: 178px;
+      margin: 0 auto 14px;
+      border: 8px solid #f5b400;
+      border-radius: 999px;
+      color: #c65a00;
+      background: #fff9e7;
+      font-size: 62px;
+      font-weight: 800;
+    }}
+    .grade-caption {{ text-align: center; }}
+    .grade-caption strong {{ display: block; font-size: 18px; }}
+    .grade-caption span {{
+      display: inline-flex;
+      margin-top: 8px;
+      padding: 4px 13px;
+      border-radius: 999px;
+      color: #0057b8;
+      background: #e8f1ff;
+      font-weight: 700;
+    }}
+    .devices {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 92px;
+      gap: 18px;
+      align-items: end;
+    }}
+    .desktop, .mobile {{
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border: 1px solid #cbd7e2;
+      background: #f6f8fb;
+      color: #7b8795;
+    }}
+    .desktop {{ height: 190px; border-radius: 8px; }}
+    .mobile {{ height: 170px; border-radius: 24px; }}
+    .desktop img, .mobile img {{ width: 100%; height: 100%; object-fit: cover; object-position: top; }}
+    .counts {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 22px;
+    }}
+    .count-card {{
+      padding: 14px;
+      border: 1px solid #dbe3eb;
+      border-radius: 8px;
+      text-align: center;
+      background: #f8fbfd;
+    }}
+    .count-card strong {{ display: block; font-size: 22px; }}
+    .pass strong {{ color: #00a965; }}
+    .warn strong {{ color: #d87600; }}
+    .fail strong {{ color: #e40046; }}
+    .skip strong {{ color: #a50041; }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    th, td {{
+      padding: 9px 10px;
+      border-top: 1px solid #e2e8f0;
+      vertical-align: top;
+      text-align: left;
+      word-break: break-word;
+    }}
+    th {{ color: #536276; background: #f4f7fa; font-weight: 700; }}
+    td small {{ display: block; margin-top: 2px; color: #7b8795; }}
+    .status {{
+      display: inline-flex;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .status-pass {{ color: #00945f; background: #e9fbf1; }}
+    .status-warning {{ color: #c65a00; background: #fff4d8; }}
+    .status-fail {{ color: #d20b3f; background: #ffe9ed; }}
+    .status-not-checked {{ color: #536276; background: #edf2f7; }}
+    pre {{
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      margin: 0;
+      padding: 10px;
+      border-radius: 8px;
+      color: #536276;
+      background: #edf3f7;
+      font-family: Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.55;
+    }}
+    .snippet-row td {{ padding-top: 0; }}
+    .guide-list {{ display: grid; gap: 10px; padding: 0; list-style: none; }}
+    .guide-list li {{
+      padding: 14px;
+      border: 1px solid #dbe3eb;
+      border-radius: 8px;
+      background: #f8fbfd;
+    }}
+    .guide-list strong {{ display: block; margin-bottom: 4px; }}
+    .guide-list span {{ color: #536276; }}
+    .muted {{ color: #536276; }}
+    .empty {{ padding: 18px; border: 1px solid #dbe3eb; border-radius: 8px; }}
+  </style>
+</head>
+<body>
+  <section>
+    <div class="brand">
+      <div><strong>ADVoost</strong> 검색 × <b>SEO.co.kr</b></div>
+      <span>{'프리미엄 웹사이트 분석 리포트' if premium else '웹사이트 분석 리포트'}</span>
+    </div>
+    <h1>진단보고서</h1>
+    <p>이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다.</p>
+    <p>수집 실패, 색인 실패, SEO 점검 필요 여부를 심층 진단하여 A에서 F까지의 등급을 제공합니다.</p>
+    <p class="warning-copy">진단 도구는 웹사이트에 대한 전반적인 점검 결과를 제공하며 검색 광고 노출을 보장하지는 않습니다.</p>
+    <h3>{escape(host)} 결과 점검하기</h3>
+    <div class="overview">
+      <div class="grade-caption">
+        <div class="grade-circle">{escape(grade)}</div>
+        <strong>{escape(report_grade_message(grade))}</strong>
+        <span>개선 필요 항목: {issue_count}</span>
+      </div>
+      <div>
+        {device_html}
+        <p class="muted">URL: {escape(url)}</p>
+        <p class="muted">분석일시: {escape(created_at)} · 점수: {escape(score)}</p>
+      </div>
+    </div>
+    <div class="counts">
+      <div class="count-card pass"><strong>{counts['PASS']}</strong><span>통과</span></div>
+      <div class="count-card warn"><strong>{counts['WARNING']}</strong><span>경고</span></div>
+      <div class="count-card fail"><strong>{counts['FAIL']}</strong><span>실패</span></div>
+      <div class="count-card skip"><strong>{counts['NOT_CHECKED']}</strong><span>수집불가</span></div>
+    </div>
+  </section>
+  {premium_sections}
+</body>
+</html>"""
+
+
+def render_report_pdfs(records: list[dict], report_type: ReportType, platform: str) -> list[tuple[str, bytes]]:
+    if sync_playwright is None:
+        raise HTTPException(status_code=503, detail="Playwright is not installed.")
+
+    results: list[tuple[str, bytes]] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            for record in records:
+                page = browser.new_page(viewport={"width": 1240, "height": 1754})
+                page.set_content(
+                    build_report_html(record, report_type, platform),
+                    wait_until="load",
+                    timeout=20000,
+                )
+                pdf = page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={"top": "14mm", "right": "12mm", "bottom": "14mm", "left": "12mm"},
+                )
+                page.close()
+                results.append((report_filename(record, report_type), pdf))
+            browser.close()
+    except PlaywrightError as exc:
+        raise HTTPException(status_code=503, detail=f"PDF renderer failed: {exc}") from exc
+
+    return results
+
+
+def disposition(filename: str) -> str:
+    return f"attachment; filename*=UTF-8''{quote(filename)}"
+
+
+@app.post("/api/reports/pdf")
+def export_report_pdf(request: ReportExportRequest) -> Response:
+    pdfs = render_report_pdfs(request.records, request.report_type, request.platform)
+    if request.bundle or len(pdfs) > 1:
+        archive = io.BytesIO()
+        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
+            for filename, data in pdfs:
+                zip_file.writestr(filename, data)
+        archive_name = (
+            "프리미엄_진단보고서_일괄.zip"
+            if request.report_type == "premium"
+            else "진단보고서_일괄.zip"
+        )
+        return Response(
+            archive.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": disposition(archive_name)},
+        )
+
+    filename, data = pdfs[0]
+    return Response(
+        data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": disposition(filename)},
+    )
