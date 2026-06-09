@@ -1619,6 +1619,14 @@ def report_text(value: object, fallback: str = "-") -> str:
     return text if text else fallback
 
 
+def report_get(data: dict, *keys: str, fallback: object = None) -> object:
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return fallback
+
+
 def report_host(raw_url: str) -> str:
     try:
         return urlparse(raw_url).netloc.replace("www.", "") or raw_url
@@ -1639,6 +1647,44 @@ def report_status_counts(record: dict) -> dict[str, int]:
         if status in counts:
             counts[status] += 1
     return counts
+
+
+def report_created_at(record: dict) -> str:
+    return report_text(report_get(record, "createdAt", "created_at"), "")
+
+
+def report_keyword_summary(record: dict) -> dict:
+    summary = report_get(record, "keywordSummary", "keyword_summary", fallback={})
+    return summary if isinstance(summary, dict) else {}
+
+
+def report_render_snapshot(record: dict) -> dict:
+    snapshot = report_get(record, "renderSnapshot", "render_snapshot", fallback={})
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def item_name(item: dict) -> str:
+    return report_text(report_get(item, "itemName", "item_name"))
+
+
+def item_detected_value(item: dict) -> str:
+    return report_text(report_get(item, "detectedValue", "detected_value") or item.get("description"))
+
+
+def item_remediation(item: dict) -> str:
+    return report_text(report_get(item, "remediation", "guide") or item.get("description"))
+
+
+def item_critical_for_grade(item: dict) -> bool:
+    return bool(report_get(item, "criticalForGrade", "critical_for_grade", fallback=False))
+
+
+def keyword_title_ok(row: dict) -> bool:
+    return bool(report_get(row, "titleOk", "title_tag", fallback=False))
+
+
+def keyword_desc_ok(row: dict) -> bool:
+    return bool(report_get(row, "descOk", "meta_description", fallback=False))
 
 
 def report_status_label(status: str) -> str:
@@ -1713,62 +1759,405 @@ def report_font_face_css() -> str:
     """
 
 
-def keyword_table_html(record: dict, key: str, title: str) -> str:
-    summary = record.get("keywordSummary") or {}
-    rows = summary.get(key) or []
+REPORT_STATUS_SORT = {"FAIL": 0, "WARNING": 1, "NOT_CHECKED": 2, "PASS": 3}
+
+
+def report_items(record: dict) -> list[dict]:
+    return list(record.get("items") or [])
+
+
+def report_snippet(item: dict, limit: int = 1300) -> str:
+    snippet = report_text(item.get("snippet"), "")
+    if not snippet:
+        return ""
+    return snippet[:limit] + ("..." if len(snippet) > limit else "")
+
+
+def report_group_name(item: dict) -> str:
+    item_id = report_text(item.get("id"), "")
+    status = report_text(item.get("status"), "")
+    category = report_text(item.get("category"), "")
+    if status == "NOT_CHECKED":
+        return "진단 제외"
+    if item_id in {"html-parse", "meta-robots"} or "색인" in category:
+        return "색인 점검항목"
+    if category == "수집" or item_id in {"http-status", "robots", "noscript"}:
+        return "수집 점검항목"
+    return "SEO 점검 필요"
+
+
+def report_grouped_items(record: dict) -> list[tuple[str, list[dict]]]:
+    groups = {
+        "SEO 점검 필요": [],
+        "색인 점검항목": [],
+        "수집 점검항목": [],
+        "진단 제외": [],
+    }
+    for item in report_items(record):
+        groups[report_group_name(item)].append(item)
+    return [(label, items) for label, items in groups.items() if items]
+
+
+def report_top_issues(record: dict, limit: int = 4) -> list[dict]:
+    items = sorted(
+        report_items(record),
+        key=lambda item: (
+            REPORT_STATUS_SORT.get(report_text(item.get("status"), ""), 9),
+            0 if item_critical_for_grade(item) else 1,
+            item_name(item),
+        ),
+    )
+    return [item for item in items if report_text(item.get("status"), "") in {"FAIL", "WARNING"}][:limit]
+
+
+def keyword_rows(record: dict, key: str) -> list[dict]:
+    summary = report_keyword_summary(record)
+    snake_key = "single_rows" if key == "singleRows" else "phrase_rows"
+    return list(summary.get(key) or summary.get(snake_key) or [])
+
+
+def keyword_bar_width(row: dict) -> int:
+    raw = report_text(row.get("ratio"), "0").replace("%", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0
+    return min(100, max(6, int(value * 120)))
+
+
+def keyword_table_html(record: dict, key: str, title: str, limit: int = 30) -> str:
+    rows = keyword_rows(record, key)
     if not rows:
         return "<p class='empty'>키워드 데이터가 없습니다.</p>"
     body = []
-    for index, row in enumerate(rows[:30], start=1):
-        title_mark = "통과" if row.get("titleOk") else "미포함"
-        desc_mark = "통과" if row.get("descOk") else "미포함"
+    for index, row in enumerate(rows[:limit], start=1):
+        title_ok = keyword_title_ok(row)
+        desc_ok = keyword_desc_ok(row)
+        title_mark = "O" if title_ok else "X"
+        desc_mark = "O" if desc_ok else "X"
         body.append(
             "<tr>"
             f"<td>{index}</td>"
             f"<td><strong>{escape(report_text(row.get('keyword')))}</strong></td>"
             f"<td>{escape(report_text(row.get('frequency')))}</td>"
+            f"<td><div class='bar-cell'><span style='width:{keyword_bar_width(row)}%'></span></div></td>"
             f"<td>{escape(report_text(row.get('ratio')))}</td>"
-            f"<td>{title_mark}</td>"
-            f"<td>{desc_mark}</td>"
+            f"<td class='mark {'ok' if title_ok else 'no'}'>{title_mark}</td>"
+            f"<td class='mark {'ok' if desc_ok else 'no'}'>{desc_mark}</td>"
             "</tr>"
         )
+    total_key = "singleTotal" if key == "singleRows" else "phraseTotal"
+    total = report_keyword_summary(record).get(total_key) or report_keyword_summary(record).get(
+        "single_total" if key == "singleRows" else "phrase_total"
+    )
+    suffix = f"<p class='table-note'>상위 {min(limit, len(rows))}개 표시 (전체 {escape(report_text(total or len(rows)))}개)</p>"
     return (
         f"<h3>{escape(title)}</h3>"
-        "<table><thead><tr><th>#</th><th>키워드</th><th>빈도수</th><th>비율</th><th>타이틀</th><th>메타 설명</th></tr></thead>"
-        f"<tbody>{''.join(body)}</tbody></table>"
+        "<table class='keyword-table'><thead><tr><th>#</th><th>키워드</th><th>빈도수</th><th>페이지 빈도율</th><th>비율</th><th>타이틀 태그</th><th>메타 디스크립션</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table>{suffix}"
     )
 
 
-def issue_rows_html(record: dict, premium: bool) -> str:
-    rows = []
-    for item in record.get("items", []):
-        status = report_text(item.get("status"), "")
-        if not premium and status == "PASS":
-            continue
-        name = escape(report_text(item.get("itemName")))
-        detected = escape(report_text(item.get("detectedValue") or item.get("description")))
-        guide = escape(report_text(item.get("remediation") or item.get("guide") or item.get("description")))
-        snippet = escape(report_text(item.get("snippet"), ""))
-        rows.append(
-            "<tr>"
-            f"<td><span class='status status-{status.lower().replace('_', '-')}'>{report_status_label(status)}</span></td>"
-            f"<td><strong>{name}</strong><small>{escape(report_text(item.get('category')))}</small></td>"
-            f"<td>{detected}</td>"
-            f"<td>{guide}</td>"
-            "</tr>"
-        )
-        if premium and snippet:
-            rows.append(
-                "<tr class='snippet-row'><td></td><td colspan='3'>"
-                f"<pre>{snippet}</pre>"
-                "</td></tr>"
-            )
-    if not rows:
-        rows.append("<tr><td colspan='4'>개선이 필요한 항목이 없습니다.</td></tr>")
+def keyword_summary_html(record: dict, compact: bool = False) -> str:
+    limit = 10 if compact else 30
     return (
-        "<table><thead><tr><th>상태</th><th>항목</th><th>감지값</th><th>개선 안내</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table>"
+        "<section class='page-break'>"
+        "<h2>키워드 요약</h2>"
+        f"{keyword_table_html(record, 'singleRows', '개별 키워드', limit)}"
+        f"{keyword_table_html(record, 'phraseRows', '구문(Phrase) 키워드', limit)}"
+        "</section>"
     )
+
+
+def issue_item_html(item: dict, premium: bool) -> str:
+    status = report_text(item.get("status"), "NOT_CHECKED")
+    name = escape(item_name(item))
+    detected = escape(item_detected_value(item))
+    guide = escape(item_remediation(item))
+    snippet = escape(report_snippet(item, 2200 if premium else 1100))
+    details_html = f"<div class='finding-copy'><strong>점검 항목:</strong> {detected}</div>"
+    if status in {"WARNING", "FAIL"}:
+        details_html = f"<div class='finding-copy warn-copy'><strong>개선 방안:</strong> {guide}</div>"
+    snippet_html = f"<pre>{snippet}</pre>" if snippet and (premium or status != "PASS") else ""
+    return (
+        f"<article class='issue-item issue-{status.lower().replace('_', '-')}'><div class='issue-head'>"
+        f"<div><span class='issue-dot'></span><strong>{name}</strong></div>"
+        f"<div class='issue-meta'><span>{detected}</span><span class='status status-{status.lower().replace('_', '-')}'>{report_status_label(status)}</span></div>"
+        f"</div>{details_html}{snippet_html}</article>"
+    )
+
+
+def issue_sections_html(record: dict, premium: bool) -> str:
+    sections = []
+    for title, items in report_grouped_items(record):
+        sorted_items = sorted(
+            items,
+            key=lambda item: (
+                REPORT_STATUS_SORT.get(report_text(item.get("status"), ""), 9),
+                item_name(item),
+            ),
+        )
+        if not premium and title == "진단 제외":
+            # Keep the exclusion section short in the standard PDF.
+            sorted_items = sorted_items[:6]
+        pass_count = sum(1 for item in sorted_items if report_text(item.get("status"), "") == "PASS")
+        warning_count = sum(1 for item in sorted_items if report_text(item.get("status"), "") == "WARNING")
+        fail_count = sum(1 for item in sorted_items if report_text(item.get("status"), "") == "FAIL")
+        summary_bits = []
+        if warning_count:
+            summary_bits.append(f"경고 {warning_count}")
+        if fail_count:
+            summary_bits.append(f"실패 {fail_count}")
+        summary_bits.append(f"통과 {pass_count}")
+        sections.append(
+            "<section class='page-break audit-section'>"
+            f"<div class='section-title'><h2>{escape(title)}</h2><span>{escape(' · '.join(summary_bits))}</span></div>"
+            f"{''.join(issue_item_html(item, premium) for item in sorted_items)}"
+            "</section>"
+        )
+    return "".join(sections)
+
+
+def premium_cover_html(record: dict, device_html: str) -> str:
+    url = report_text(record.get("url"))
+    host = report_host(url)
+    grade = report_text(record.get("grade"), "C")
+    created_at = report_created_at(record)
+    return f"""
+    <section class="premium-cover">
+      <div class="cover-brand">kt nasmedia</div>
+      <div class="cover-content">
+        <p class="cover-kicker">ADVoost Search Diagnostic Report</p>
+        <h1>애드부스트 검색 진단 보고서</h1>
+        <div class="cover-url">분석 대상: {escape(url)}</div>
+      </div>
+      <div class="cover-score">
+        <div class="cover-grade">{escape(grade)}</div>
+        <strong>랜딩페이지 분석 종합 점수</strong>
+      </div>
+      <div class="cover-bottom">
+        <div class="cover-preview">{device_html}</div>
+        <span>발행일: {escape(created_at[:10])} | {escape(host)} 진단보고서</span>
+      </div>
+    </section>
+    """
+
+
+def premium_summary_html(record: dict) -> str:
+    counts = report_status_counts(record)
+    grade = report_text(record.get("grade"), "C")
+    top_issues = report_top_issues(record, 4)
+    findings = "".join(
+        f"<li><span>{index}</span><strong>{escape(item_name(item))}</strong><b>즉시 조치 필요</b></li>"
+        for index, item in enumerate(top_issues, start=1)
+    ) or "<li><span>1</span><strong>즉시 조치가 필요한 항목 없음</strong><b>유지 관리</b></li>"
+    return f"""
+    <section class="page-break premium-summary">
+      <p class="eyebrow">EXECUTIVE SUMMARY</p>
+      <h2>한눈에 보는 진단 결과</h2>
+      <div class="summary-grid">
+        <div class="summary-card">
+          <div class="donut"><strong>{sum(counts.values())}</strong><span>총 점검 항목</span></div>
+          <ul class="legend">
+            <li><b class="green"></b>통과 {counts['PASS']}</li>
+            <li><b class="orange"></b>경고 {counts['WARNING']}</li>
+            <li><b class="red"></b>실패 {counts['FAIL']}</li>
+            <li><b class="gray"></b>수집불가 {counts['NOT_CHECKED']}</li>
+          </ul>
+        </div>
+        <div class="summary-card">
+          <h3>종합 AEO(SEO) 등급</h3>
+          <div class="grade-scale"><span>A</span><span>B</span><span class="active">{escape(grade)}</span><span>D</span><span>F</span></div>
+          <p class="grade-band">현재 등급: {escape(grade)} ({escape(report_grade_message(grade))})</p>
+        </div>
+      </div>
+      <h3>해결이 필요한 문제점</h3>
+      <ul class="key-findings">{findings}</ul>
+    </section>
+    """
+
+
+def readiness_categories(record: dict) -> list[tuple[str, float, str]]:
+    items = report_items(record)
+    buckets = [
+        ("콘텐츠 연관성", {"콘텐츠", "SEO 점검항목", "소셜"}),
+        ("수집 안정성", {"수집"}),
+        ("색인 가능성", {"메타", "브랜드"}),
+        ("성능·모바일", {"성능", "모바일"}),
+        ("메타·공유·구조화", {"기술", "전환"}),
+    ]
+    result = []
+    for label, categories in buckets:
+        bucket_items = [item for item in items if report_text(item.get("category"), "") in categories]
+        total = max(1, len(bucket_items))
+        penalty = sum(
+            2 if report_text(item.get("status"), "") == "FAIL" else 1
+            for item in bucket_items
+            if report_text(item.get("status"), "") in {"WARNING", "FAIL"}
+        )
+        score = max(0, min(100, round(((total * 2 - penalty) / (total * 2)) * 100, 1)))
+        result.append((label, score, "#ef4444" if score < 60 else "#f97316" if score < 80 else "#22c55e"))
+    return result
+
+
+def premium_ars_html(record: dict) -> str:
+    score = int(record.get("score") or 0)
+    current = max(1.0, min(10.0, round(score / 10, 1)))
+    after = min(10.0, round(current + len(report_top_issues(record, 6)) * 0.5, 1))
+    rows = "".join(
+        f"<tr><td>{escape(label)}</td><td>{score_value:.1f} / 100</td><td><div class='score-bar'><span style='width:{score_value}%; background:{color}'></span></div></td></tr>"
+        for label, score_value, color in readiness_categories(record)
+    )
+    return f"""
+    <section class="page-break ars-page">
+      <p class="eyebrow">ADVoost Readiness Score</p>
+      <h2>ARS Score — 광고연관지수 (프리미엄 지표)</h2>
+      <div class="ars-grid">
+        <div class="meter-card"><span>현재 ARS Score</span><strong>{current}</strong><small>/ 10</small></div>
+        <div class="meter-arrow">BEFORE → AFTER</div>
+        <div class="meter-card after"><span>경고 해결 후 예상 ARS</span><strong>{after}</strong><small>/ 10</small></div>
+      </div>
+      <h3>ARS 산출 근거 카테고리</h3>
+      <table class="score-table"><thead><tr><th>검진 카테고리</th><th>현재 / 만점</th><th>점수 바</th></tr></thead><tbody>{rows}</tbody></table>
+      <p class="table-note">ARS는 내부 분석 지표이며 실제 네이버 광고연관지수와 동일하지 않을 수 있습니다.</p>
+    </section>
+    """
+
+
+def premium_overall_results_html(record: dict) -> str:
+    total_count = len(report_items(record))
+    colors_by_group = {
+        "SEO 점검 필요": "#e9fbf1",
+        "색인 점검항목": "#edf5ff",
+        "수집 점검항목": "#fff4e8",
+        "진단 제외": "#f5f7fb",
+    }
+    columns = []
+    for title, items in report_grouped_items(record):
+        if title == "진단 제외":
+            continue
+        rows = "".join(
+            f"<li><span class='status-dot status-dot-{report_text(item.get('status'), '').lower().replace('_', '-')}'></span>{escape(item_name(item))}<b>{report_status_label(report_text(item.get('status'), ''))}</b></li>"
+            for item in items[:14]
+        )
+        columns.append(
+            f"<div class='result-column'><h3 style='background:{colors_by_group.get(title, '#f5f7fb')}'>{escape(title)} ({len(items)}개)</h3><ul>{rows}</ul></div>"
+        )
+    return f"""
+    <section class="page-break">
+      <p class="eyebrow">DETAILED AUDIT RESULTS</p>
+      <h2>{total_count}개 점검 항목 전체 결과</h2>
+      <div class="result-columns">{''.join(columns)}</div>
+    </section>
+    """
+
+
+def premium_keyword_match_html(record: dict) -> str:
+    rows = keyword_rows(record, "singleRows")[:10]
+    cloud = "".join(
+        f"<span style='font-size:{18 + min(22, int(row.get('frequency') or 1) * 3)}px; transform:rotate({(-18 + index * 7) % 34 - 17}deg)'>{escape(report_text(row.get('keyword')))}</span>"
+        for index, row in enumerate(rows)
+    )
+    table = keyword_table_html(record, "singleRows", "키워드 - 메타 정보 매칭 현황", 10)
+    missing = sum(1 for row in rows if not keyword_title_ok(row) or not keyword_desc_ok(row))
+    return f"""
+    <section class="page-break keyword-match">
+      <p class="eyebrow">KEYWORD TO META TAG MATCHING</p>
+      <h2>페이지 키워드 - 메타태그 매칭 분석</h2>
+      <div class="keyword-match-grid">
+        <div class="word-cloud">{cloud or '<span>키워드 없음</span>'}</div>
+        <div>{table}</div>
+      </div>
+      <div class="alert-box">현재 페이지 내 고빈도 핵심 키워드 중 {missing}개가 title 또는 meta description에 충분히 반영되지 않았습니다.</div>
+    </section>
+    """
+
+
+def premium_platform_guide_html(record: dict, platform: str) -> str:
+    guide_items = "".join(
+        f"<li><strong>{escape(title)}</strong><span>{escape(copy)}</span></li>"
+        for title, copy in platform_guide(platform)
+    )
+    issues = "".join(
+        f"<li><b>{index}</b><strong>{escape(item_name(item))}</strong><span>{escape(item_remediation(item))}</span></li>"
+        for index, item in enumerate(report_top_issues(record, 4), start=1)
+    )
+    return f"""
+    <section class="page-break platform-page">
+      <p class="eyebrow">{escape(platform)} PLATFORM FIX GUIDE</p>
+      <h2>발견된 항목 — {escape(platform)} 수정 가이드</h2>
+      <div class="platform-grid">
+        <aside><strong>{escape(platform)}</strong><p>선택한 쇼핑/CMS 환경 기준으로 우선 조치 항목을 정리했습니다.</p></aside>
+        <div>
+          <h3>우선 수정 항목</h3>
+          <ol class="fix-list">{issues or '<li><b>1</b><strong>우선 수정 항목 없음</strong><span>현재 상태를 유지 관리하세요.</span></li>'}</ol>
+          <h3>플랫폼 공통 가이드</h3>
+          <ul class="guide-list">{guide_items}</ul>
+        </div>
+      </div>
+    </section>
+    """
+
+
+def premium_glossary_html() -> str:
+    rows = [
+        ("Meta Description", "검색결과 하단에 표시되는 페이지 요약문", "누락 시 본문 임의 추출로 페이지 콘텐츠 파악 불가"),
+        ("<title> 태그", "브라우저 탭 및 검색결과 제목에 표시되는 텍스트", "검색엔진 주제 파악 및 광고연관지수 핵심 신호"),
+        ("<H1> 태그", "페이지 본문 내 최상위 주제 제목", "문서 구조 파악의 핵심, 연관도 평가 주요 지표"),
+        ("Alt 속성", "이미지 내용을 텍스트로 설명하는 대체 정보", "이미지 검색 노출 및 접근성 필수"),
+        ("Open Graph", "SNS 링크 공유 시 표시되는 썸네일/제목 미리보기 정보", "카카오톡/페이스북 등 외부 채널 바이럴 효율 저하 방지"),
+        ("페이지 로딩 시간", "브라우저에서 전체 페이지가 안전 로드되는 시간", "3초 초과 시 이탈률 증가, 광고 효율 영향"),
+        ("Schema.org", "검색엔진 이해도를 높이는 구조화 마크업", "리뷰/가격 등 리치 스니펫 노출로 클릭률 강화"),
+    ]
+    body = "".join(f"<tr><td><strong>{escape(a)}</strong></td><td>{escape(b)}</td><td>{escape(c)}</td></tr>" for a, b, c in rows)
+    return f"""
+    <section class="page-break">
+      <p class="eyebrow">GLOSSARY OF AEO(SEO) AUDIT FACTORS</p>
+      <h2>필수 점검 항목 정의</h2>
+      <table><thead><tr><th>항목</th><th>정의 (What)</th><th>비즈니스 임팩트 (Why)</th></tr></thead><tbody>{body}</tbody></table>
+      <div class="method-box">방법론: Google Search Quality Evaluator Guidelines, Search Central, Schema.org, W3C 접근성 표준을 참고해 내부 기준으로 정성 추정합니다.</div>
+    </section>
+    """
+
+
+def premium_action_plan_html() -> str:
+    return """
+    <section class="page-break action-page">
+      <p class="eyebrow">SEO TO AD PERFORMANCE MAPPING</p>
+      <h2>애드부스트 광고 운영 연계 액션플랜</h2>
+      <div class="action-grid">
+        <div class="action-card"><h3>광고 연관지수 개선</h3><ul><li>메타 타이틀·디스크립션 및 페이지 핵심 문구 개선</li><li>광고 키워드와 랜딩페이지 본문/태그 간 연관도 강화</li></ul></div>
+        <div class="action-card green"><h3>클릭 기대지수 개선</h3><ul><li>광고 소재 이미지와 확장소재 품질 개선</li><li>검색결과에 노출되는 공급 문구와 이미지 매력도 강화</li></ul></div>
+        <div class="action-card"><h3>활용법 4가지</h3><ol><li>동일 URL에 등록된 광고 키워드 연결도 점검</li><li>후보 랜딩 비교 후 저연관 조합 제외</li><li>랜딩 콘텐츠 보강 방향 도출</li><li>재진단으로 개선 여부 추적</li></ol></div>
+        <div class="action-card green"><h3>클릭 기대지수 활용법</h3><ol><li>소재 제목·설명·이미지 개선</li><li>가격/혜택/신뢰 요소 강화</li><li>확장소재 조합 테스트</li><li>검색 의도별 문구 실험</li></ol></div>
+      </div>
+    </section>
+    """
+
+
+def premium_appendix_html() -> str:
+    rows = [
+        ("SEO", "검색엔진 최적화", "Alt 속성", "이미지 대체 텍스트"),
+        ("SERP", "검색 결과 페이지", "Viewport", "모바일 화면 표시 영역 메타"),
+        ("CTR", "클릭률", "robots.txt", "크롤러 수집 지시 파일"),
+        ("CPC", "클릭 비용", "Content-Type", "HTTP 응답 콘텐츠 유형"),
+        ("ROAS", "광고 투자 수익률", "Soft 404", "정상 응답이지만 오류 페이지"),
+        ("OG", "SNS 공유 미리보기 메타", "ADVoost", "네이버 AI 광고 시스템"),
+    ]
+    body = "".join(f"<tr><td><strong>{a}</strong></td><td>{b}</td><td><strong>{c}</strong></td><td>{d}</td></tr>" for a, b, c, d in rows)
+    return f"""
+    <section class="page-break appendix-page">
+      <p class="eyebrow">GLOSSARY & REFERENCES</p>
+      <h2>부록 (Appendix & References)</h2>
+      <table><tbody>{body}</tbody></table>
+    </section>
+    <section class="page-break end-page">
+      <span>EOD</span>
+      <h2>지금 개선하면, 광고 효율이 달라집니다.</h2>
+      <div class="contact-card"><strong>문의</strong><p>mc2@nasmedia.co.kr</p></div>
+      <footer>kt nasmedia | Confidential</footer>
+    </section>
+    """
 
 
 def build_report_html(record: dict, report_type: ReportType, platform: str) -> str:
@@ -1778,15 +2167,11 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     host = report_host(url)
     grade = report_text(record.get("grade"), "C")
     score = report_text(record.get("score"), "0")
-    created_at = report_text(record.get("createdAt"))
-    snapshot = record.get("renderSnapshot") or {}
-    desktop = report_text(snapshot.get("desktopScreenshot"), "")
-    mobile = report_text(snapshot.get("mobileScreenshot"), "")
+    created_at = report_created_at(record)
+    snapshot = report_render_snapshot(record)
+    desktop = report_text(report_get(snapshot, "desktopScreenshot", "desktop_screenshot"), "")
+    mobile = report_text(report_get(snapshot, "mobileScreenshot", "mobile_screenshot"), "")
     issue_count = counts["WARNING"] + counts["FAIL"]
-    guide_items = "".join(
-        f"<li><strong>{escape(title)}</strong><span>{escape(copy)}</span></li>"
-        for title, copy in platform_guide(platform)
-    )
     desktop_html = (
         f'<img src="{escape(desktop, quote=True)}" />'
         if desktop
@@ -1803,31 +2188,29 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
         f"<div class='mobile'>{mobile_html}</div>"
         "</div>"
     )
-    premium_sections = ""
+    intro_title = "한눈에 보는 진단 결과" if premium else "진단보고서"
+    intro_copy = (
+        "프리미엄 리포트는 진단 결과를 광고 운영 관점의 개선 우선순위와 플랫폼 수정 가이드로 재구성합니다."
+        if premium
+        else "이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다."
+    )
     if premium:
-        premium_sections = f"""
-        <section class="page-break">
-          <h2>프리미엄 플랫폼 수정 가이드</h2>
-          <p class="muted">선택 플랫폼: <strong>{escape(platform)}</strong></p>
-          <ul class="guide-list">{guide_items}</ul>
-        </section>
-        <section class="page-break">
-          <h2>키워드 요약</h2>
-          {keyword_table_html(record, "singleRows", "개별 키워드")}
-          {keyword_table_html(record, "phraseRows", "프레이즈 키워드")}
-        </section>
-        <section class="page-break">
-          <h2>전체 점검 세부 내역</h2>
-          {issue_rows_html(record, premium=True)}
-        </section>
-        """
+        report_sections = (
+            premium_summary_html(record)
+            + premium_ars_html(record)
+            + premium_overall_results_html(record)
+            + keyword_summary_html(record, compact=True)
+            + premium_keyword_match_html(record)
+            + issue_sections_html(record, premium=True)
+            + premium_platform_guide_html(record, platform)
+            + premium_glossary_html()
+            + premium_action_plan_html()
+            + premium_appendix_html()
+        )
+        leading_section = premium_cover_html(record, device_html)
     else:
-        premium_sections = f"""
-        <section class="page-break">
-          <h2>개선 필요 항목</h2>
-          {issue_rows_html(record, premium=False)}
-        </section>
-        """
+        report_sections = keyword_summary_html(record, compact=False) + issue_sections_html(record, premium=False)
+        leading_section = ""
 
     return f"""<!doctype html>
 <html lang="ko">
@@ -1842,11 +2225,19 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       color: #06132a;
       background: #fff;
       font-family: "ADVoostReport", "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
-      font-size: 13px;
-      line-height: 1.65;
+      font-size: 12.5px;
+      line-height: 1.58;
     }}
     section {{ margin-bottom: 20px; }}
     .page-break {{ break-before: page; }}
+    .eyebrow {{
+      margin: 0 0 8px;
+      color: #7a8797;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }}
     .brand {{
       display: flex;
       justify-content: space-between;
@@ -1856,9 +2247,9 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     }}
     .brand strong {{ color: #3346a3; font-size: 20px; }}
     .brand b {{ font-size: 20px; }}
-    h1 {{ margin: 32px 0 12px; font-size: 28px; line-height: 1.25; }}
-    h2 {{ margin: 0 0 14px; font-size: 21px; }}
-    h3 {{ margin: 18px 0 10px; font-size: 16px; }}
+    h1 {{ margin: 30px 0 12px; font-size: 27px; line-height: 1.24; }}
+    h2 {{ margin: 0 0 14px; font-size: 20px; line-height: 1.25; }}
+    h3 {{ margin: 17px 0 10px; font-size: 15px; }}
     p {{ margin: 0 0 8px; color: #536276; }}
     .warning-copy {{ margin-top: 18px; color: #f00000; font-weight: 700; }}
     .overview {{
@@ -1937,6 +2328,18 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     }}
     th {{ color: #536276; background: #f4f7fa; font-weight: 700; }}
     td small {{ display: block; margin-top: 2px; color: #7b8795; }}
+    .keyword-table th:nth-child(1), .keyword-table td:nth-child(1) {{ width: 46px; text-align: center; white-space: nowrap; }}
+    .keyword-table th:nth-child(2), .keyword-table td:nth-child(2) {{ width: 31%; }}
+    .keyword-table th:nth-child(3), .keyword-table td:nth-child(3) {{ width: 70px; text-align: right; }}
+    .keyword-table th:nth-child(5), .keyword-table td:nth-child(5) {{ width: 70px; }}
+    .keyword-table th:nth-child(6), .keyword-table td:nth-child(6),
+    .keyword-table th:nth-child(7), .keyword-table td:nth-child(7) {{ width: 92px; text-align: center; }}
+    .bar-cell {{ width: 100%; height: 8px; border-radius: 99px; background: #e8eef3; overflow: hidden; }}
+    .bar-cell span {{ display: block; height: 100%; border-radius: inherit; background: #10c98b; }}
+    .mark {{ font-weight: 800; }}
+    .mark.ok {{ color: #00945f; }}
+    .mark.no {{ color: #cf103d; }}
+    .table-note {{ margin: 8px 0 18px; text-align: right; color: #8b97a7; font-size: 11px; }}
     .status {{
       display: inline-flex;
       padding: 3px 9px;
@@ -1960,7 +2363,66 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       font-size: 10px;
       line-height: 1.55;
     }}
-    .snippet-row td {{ padding-top: 0; }}
+    .section-title {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 18px;
+      border: 1px solid #dbe3eb;
+      border-bottom: 0;
+      border-radius: 8px 8px 0 0;
+      background: #f7f9fc;
+    }}
+    .section-title h2 {{ margin: 0; }}
+    .section-title span {{ color: #00945f; font-weight: 700; }}
+    .issue-item {{
+      break-inside: avoid;
+      padding: 14px 18px;
+      border: 1px solid #dbe3eb;
+      border-top: 0;
+      background: #fff;
+    }}
+    .issue-item:last-child {{ border-radius: 0 0 8px 8px; }}
+    .issue-head {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(180px, 42%);
+      gap: 14px;
+      align-items: center;
+      margin-bottom: 10px;
+    }}
+    .issue-head > div:first-child {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      font-size: 15px;
+    }}
+    .issue-dot {{
+      width: 13px;
+      height: 13px;
+      border-radius: 99px;
+      border: 2px solid #00b967;
+      flex: 0 0 auto;
+    }}
+    .issue-warning .issue-dot {{ border-color: #ff8a00; }}
+    .issue-fail .issue-dot {{ border-color: #ff3347; }}
+    .issue-not-checked .issue-dot {{ border-color: #9aa7b5; }}
+    .issue-meta {{
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 10px;
+      color: #536276;
+      text-align: right;
+    }}
+    .finding-copy {{
+      margin: 0 0 10px 24px;
+      padding: 9px 12px;
+      border-radius: 7px;
+      color: #087141;
+      background: #edfbf3;
+    }}
+    .warn-copy {{ color: #536276; background: #fff8e7; }}
     .guide-list {{ display: grid; gap: 10px; padding: 0; list-style: none; }}
     .guide-list li {{
       padding: 14px;
@@ -1972,16 +2434,220 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .guide-list span {{ color: #536276; }}
     .muted {{ color: #536276; }}
     .empty {{ padding: 18px; border: 1px solid #dbe3eb; border-radius: 8px; }}
+    .premium-cover {{
+      position: relative;
+      min-height: 260mm;
+      margin: -17mm -15mm 0;
+      padding: 24mm 20mm;
+      color: #fff;
+      background: #1b2e4d;
+      break-after: page;
+    }}
+    .cover-brand {{ color: #ff2434; font-size: 20px; font-weight: 800; }}
+    .cover-content {{ margin-top: 52mm; }}
+    .cover-kicker {{ color: #29d978; font-weight: 800; }}
+    .premium-cover h1 {{ max-width: 540px; color: #fff; font-size: 36px; }}
+    .cover-url {{
+      width: 60%;
+      margin-top: 18px;
+      padding: 12px 16px;
+      border-left: 4px solid #2de078;
+      border-radius: 4px;
+      background: rgba(82, 111, 169, .35);
+      font-weight: 700;
+    }}
+    .cover-score {{ position: absolute; right: 70px; top: 250px; text-align: center; }}
+    .cover-grade {{
+      display: grid;
+      place-items: center;
+      width: 140px;
+      height: 140px;
+      margin-bottom: 10px;
+      border: 7px solid #f5b400;
+      border-radius: 999px;
+      color: #ff8b1a;
+      font-size: 54px;
+      font-weight: 800;
+    }}
+    .cover-bottom {{
+      position: absolute;
+      left: 20mm;
+      right: 20mm;
+      bottom: 24mm;
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      border-top: 1px solid rgba(255,255,255,.18);
+      padding-top: 18px;
+      color: #b9c8dc;
+    }}
+    .cover-preview .devices {{ width: 190px; grid-template-columns: 120px 46px; gap: 10px; }}
+    .cover-preview .desktop {{ height: 78px; }}
+    .cover-preview .mobile {{ height: 82px; border-radius: 12px; }}
+    .summary-grid, .ars-grid, .keyword-match-grid, .platform-grid, .action-grid {{
+      display: grid;
+      gap: 16px;
+    }}
+    .summary-grid {{ grid-template-columns: 1fr 1fr; }}
+    .summary-card, .meter-card, .platform-grid aside, .action-card, .method-box, .alert-box, .contact-card {{
+      border: 1px solid #dbe3eb;
+      border-radius: 8px;
+      background: #fff;
+      padding: 18px;
+    }}
+    .summary-card {{ display: flex; gap: 22px; align-items: center; }}
+    .donut {{
+      display: grid;
+      place-items: center;
+      width: 126px;
+      height: 126px;
+      border-radius: 999px;
+      border: 18px solid #22c55e;
+      text-align: center;
+    }}
+    .donut strong {{ display: block; font-size: 28px; }}
+    .donut span {{ display: block; color: #536276; font-size: 10px; }}
+    .legend {{ margin: 0; padding: 0; list-style: none; color: #536276; }}
+    .legend li {{ margin: 4px 0; }}
+    .legend b {{ display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 99px; }}
+    .green {{ background: #22c55e; }}
+    .orange {{ background: #f97316; }}
+    .red {{ background: #ef4444; }}
+    .gray {{ background: #cbd5e1; }}
+    .grade-scale {{
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 0;
+      width: 100%;
+      margin: 12px 0;
+      overflow: hidden;
+      border-radius: 999px;
+      background: linear-gradient(90deg,#22c55e,#5dde84,#f6c945,#f97316,#ef4444);
+    }}
+    .grade-scale span {{ padding: 10px 0; color: #17304d; text-align: center; font-weight: 700; }}
+    .grade-scale .active {{ outline: 2px solid #ff7a1a; outline-offset: -4px; border-radius: 999px; background: rgba(255,255,255,.72); }}
+    .grade-band {{ padding: 9px 12px; border-radius: 8px; color: #f97316; background: #fff3e5; text-align: center; font-weight: 700; }}
+    .key-findings {{
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      padding: 0;
+      list-style: none;
+    }}
+    .key-findings li {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #ffd0b3;
+      border-left: 4px solid #f97316;
+      border-radius: 8px;
+    }}
+    .key-findings span {{
+      display: grid;
+      place-items: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 99px;
+      color: #f97316;
+      background: #fff3e5;
+      font-weight: 800;
+    }}
+    .key-findings strong {{ flex: 1; }}
+    .key-findings b {{ color: #ff6b37; font-size: 11px; }}
+    .ars-grid {{ grid-template-columns: 1fr 120px 1fr; align-items: center; }}
+    .meter-card {{ text-align: center; }}
+    .meter-card strong {{ color: #f97316; font-size: 38px; }}
+    .meter-card.after strong {{ color: #22c55e; }}
+    .meter-arrow {{ color: #22c55e; text-align: center; font-weight: 800; }}
+    .score-bar {{ height: 9px; overflow: hidden; border-radius: 99px; background: #edf2f7; }}
+    .score-bar span {{ display: block; height: 100%; border-radius: inherit; }}
+    .score-table th:nth-child(1), .score-table td:nth-child(1) {{ width: 34%; }}
+    .score-table th:nth-child(2), .score-table td:nth-child(2) {{ width: 110px; text-align: center; }}
+    .result-columns {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }}
+    .result-column {{ border: 1px solid #dbe3eb; border-radius: 8px; overflow: hidden; }}
+    .result-column h3 {{ margin: 0; padding: 12px; }}
+    .result-column ul {{ margin: 0; padding: 8px 10px 12px; list-style: none; }}
+    .result-column li {{
+      display: grid;
+      grid-template-columns: 14px 1fr auto;
+      gap: 6px;
+      align-items: center;
+      padding: 7px 0;
+      border-bottom: 1px solid #edf2f7;
+      font-size: 11px;
+    }}
+    .result-column li:last-child {{ border-bottom: 0; }}
+    .result-column b {{ padding: 2px 7px; border-radius: 99px; color: #00945f; background: #e9fbf1; }}
+    .status-dot {{ width: 10px; height: 10px; border: 2px solid #22c55e; border-radius: 99px; }}
+    .status-dot-warning {{ border-color: #f97316; }}
+    .status-dot-fail {{ border-color: #ef4444; }}
+    .keyword-match-grid {{ grid-template-columns: .9fr 1.1fr; }}
+    .word-cloud {{
+      display: flex;
+      min-height: 290px;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      border: 1px solid #dbe3eb;
+      border-radius: 8px;
+      color: #06132a;
+      background: #fff;
+      font-weight: 800;
+    }}
+    .word-cloud span:nth-child(3n) {{ color: #16a34a; }}
+    .alert-box {{ margin-top: 14px; color: #d65a00; background: #fff8ef; }}
+    .platform-grid {{ grid-template-columns: 260px 1fr; }}
+    .platform-grid aside {{ background: #f8fbfd; }}
+    .platform-grid aside strong {{
+      display: inline-flex;
+      margin-bottom: 12px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      color: #fff;
+      background: #ff7a1a;
+      font-size: 16px;
+    }}
+    .fix-list {{ display: grid; gap: 10px; padding-left: 0; list-style: none; }}
+    .fix-list li {{ display: grid; grid-template-columns: 24px 180px 1fr; gap: 10px; padding: 12px; border-bottom: 1px solid #edf2f7; }}
+    .fix-list b {{ color: #ff7a1a; }}
+    .fix-list span {{ color: #536276; }}
+    .action-grid {{ grid-template-columns: repeat(2, 1fr); }}
+    .action-card {{ background: #f8fbfd; }}
+    .action-card.green {{ background: #eefbf4; }}
+    .action-card h3 {{ margin-top: 0; }}
+    .action-card li {{ margin-bottom: 7px; }}
+    .method-box {{ margin-top: 16px; color: #536276; background: #f8fbfd; }}
+    .appendix-page table td {{ width: 25%; }}
+    .end-page {{
+      display: grid;
+      min-height: 250mm;
+      place-items: center;
+      text-align: center;
+    }}
+    .end-page > span {{
+      padding: 8px 26px;
+      border-radius: 999px;
+      color: #00945f;
+      background: #e9fbf1;
+      font-weight: 800;
+      letter-spacing: .18em;
+    }}
+    .end-page h2 {{ font-size: 30px; }}
+    .contact-card {{ width: 280px; }}
+    .end-page footer {{ position: absolute; bottom: 18mm; color: #8b97a7; }}
   </style>
 </head>
 <body>
+  {leading_section}
   <section>
     <div class="brand">
       <div><strong>ADVoost</strong> 검색 × <b>SEO.co.kr</b></div>
       <span>{'프리미엄 웹사이트 분석 리포트' if premium else '웹사이트 분석 리포트'}</span>
     </div>
-    <h1>진단보고서</h1>
-    <p>이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다.</p>
+    <h1>{escape(intro_title)}</h1>
+    <p>{escape(intro_copy)}</p>
     <p>수집 실패, 색인 실패, SEO 점검 필요 여부를 심층 진단하여 A에서 F까지의 등급을 제공합니다.</p>
     <p class="warning-copy">진단 도구는 웹사이트에 대한 전반적인 점검 결과를 제공하며 검색 광고 노출을 보장하지는 않습니다.</p>
     <h3>{escape(host)} 결과 점검하기</h3>
@@ -2004,7 +2670,7 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       <div class="count-card skip"><strong>{counts['NOT_CHECKED']}</strong><span>수집불가</span></div>
     </div>
   </section>
-  {premium_sections}
+  {report_sections}
 </body>
 </html>"""
 
@@ -2267,10 +2933,10 @@ class ReportLabPdf:
 
     def item_block(self, item: dict, premium: bool) -> None:
         status = report_text(item.get("status"), "NOT_CHECKED")
-        name = report_text(item.get("itemName"))
+        name = item_name(item)
         category = report_text(item.get("category"))
-        detected = report_text(item.get("detectedValue") or item.get("description"))
-        guide = report_text(item.get("remediation") or item.get("guide") or item.get("description"))
+        detected = item_detected_value(item)
+        guide = item_remediation(item)
         snippet = report_text(item.get("snippet"), "")
         self.ensure_space(70)
         block_top = self.y
@@ -2323,13 +2989,213 @@ def draw_keyword_rows(pdf: ReportLabPdf, rows: list[dict], title: str) -> None:
             report_text(row.get("keyword")),
             report_text(row.get("frequency")),
             report_text(row.get("ratio")),
-            "통과" if row.get("titleOk") else "미포함",
-            "통과" if row.get("descOk") else "미포함",
+            "통과" if keyword_title_ok(row) else "미포함",
+            "통과" if keyword_desc_ok(row) else "미포함",
         ]
         for offset, value in zip(columns, values):
             pdf.canvas.drawString(pdf.margin_x + offset, y - 6, value[:24])
         pdf.y -= 18
     pdf.y -= 6
+
+
+def reportlab_new_page(pdf: ReportLabPdf, premium: bool) -> None:
+    pdf.canvas.showPage()
+    pdf.y = pdf.height - pdf.margin_top
+    pdf.header(premium)
+
+
+def draw_reportlab_cover(pdf: ReportLabPdf, record: dict, platform: str) -> None:
+    url = report_text(record.get("url"))
+    grade = report_text(record.get("grade"), "C")
+    created_at = report_created_at(record)
+    snapshot = report_render_snapshot(record)
+    pdf.canvas.setFillColor(pdf_hex("#1b2e4d"))
+    pdf.canvas.rect(0, 0, pdf.width, pdf.height, fill=1, stroke=0)
+    pdf.canvas.setFont(pdf.bold_font, 19)
+    pdf.canvas.setFillColor(pdf_hex("#ff2434"))
+    pdf.canvas.drawString(pdf.margin_x, pdf.height - 46, "kt nasmedia")
+    pdf.canvas.setFont(pdf.bold_font, 10)
+    pdf.canvas.setFillColor(pdf_hex("#29d978"))
+    pdf.canvas.drawString(pdf.margin_x, pdf.height - 205, "ADVoost Search Diagnostic Report")
+    pdf.canvas.setFont(pdf.bold_font, 30)
+    pdf.canvas.setFillColor(pdf_hex("#ffffff"))
+    pdf.canvas.drawString(pdf.margin_x, pdf.height - 240, "애드부스트 검색 진단 보고서")
+    pdf.canvas.setFillColor(pdf_hex("#2b4070"))
+    pdf.canvas.roundRect(pdf.margin_x, pdf.height - 288, 360, 28, 4, fill=1, stroke=0)
+    pdf.canvas.setFillColor(pdf_hex("#2de078"))
+    pdf.canvas.rect(pdf.margin_x, pdf.height - 288, 3, 28, fill=1, stroke=0)
+    pdf.canvas.setFont(pdf.bold_font, 10)
+    pdf.canvas.setFillColor(pdf_hex("#ffffff"))
+    pdf.canvas.drawString(pdf.margin_x + 14, pdf.height - 279, f"분석 대상: {url[:60]}")
+    center_x = pdf.width - pdf.margin_x - 110
+    center_y = pdf.height - 270
+    pdf.canvas.setStrokeColor(pdf_hex("#f5b400"))
+    pdf.canvas.setFillColor(pdf_hex("#1b2e4d"))
+    pdf.canvas.setLineWidth(5)
+    pdf.canvas.circle(center_x, center_y, 48, stroke=1, fill=1)
+    pdf.canvas.setFont(pdf.bold_font, 30)
+    pdf.canvas.setFillColor(pdf_hex("#ff8b1a"))
+    pdf.canvas.drawCentredString(center_x, center_y - 10, grade)
+    pdf.canvas.setLineWidth(1)
+    bottom_y = 150
+    pdf.canvas.setStrokeColor(pdf_hex("#40577b"))
+    pdf.canvas.line(pdf.margin_x, bottom_y + 90, pdf.width - pdf.margin_x, bottom_y + 90)
+    pdf.draw_image_frame(report_get(snapshot, "desktopScreenshot", "desktop_screenshot"), pdf.margin_x, bottom_y + 72, 80, 52, "데스크톱")
+    pdf.draw_image_frame(report_get(snapshot, "mobileScreenshot", "mobile_screenshot"), pdf.margin_x + 92, bottom_y + 72, 34, 52, "모바일")
+    pdf.canvas.setFont(pdf.bold_font, 9)
+    pdf.canvas.setFillColor(pdf_hex("#c3d0e3"))
+    pdf.canvas.drawRightString(pdf.width - pdf.margin_x, bottom_y + 30, f"발행일: {created_at[:10]} | 플랫폼: {platform}")
+    pdf.canvas.showPage()
+    pdf.y = pdf.height - pdf.margin_top
+
+
+def draw_reportlab_summary(pdf: ReportLabPdf, record: dict, premium: bool) -> None:
+    counts = report_status_counts(record)
+    grade = report_text(record.get("grade"), "C")
+    pdf.heading("한눈에 보는 진단 결과", 18)
+    top = pdf.y
+    pdf.ensure_space(150)
+    card_w = (pdf.content_width - 12) / 2
+    for index, title in enumerate(["총 점검 항목", "종합 AEO(SEO) 등급"]):
+        x = pdf.margin_x + index * (card_w + 12)
+        pdf.canvas.setFillColor(pdf_hex("#ffffff"))
+        pdf.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+        pdf.canvas.roundRect(x, top - 112, card_w, 112, 6, fill=1, stroke=1)
+        pdf.canvas.setFont(pdf.bold_font, 11)
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        pdf.canvas.drawString(x + 12, top - 22, title)
+        if index == 0:
+            pdf.canvas.setStrokeColor(pdf_hex("#22c55e"))
+            pdf.canvas.setLineWidth(12)
+            pdf.canvas.circle(x + 72, top - 66, 34, stroke=1, fill=0)
+            pdf.canvas.setLineWidth(1)
+            pdf.canvas.setFont(pdf.bold_font, 20)
+            pdf.canvas.drawCentredString(x + 72, top - 73, str(sum(counts.values())))
+            pdf.canvas.setFont(pdf.regular_font, 8)
+            pdf.canvas.setFillColor(pdf_hex("#536276"))
+            pdf.canvas.drawString(x + 132, top - 48, f"통과 {counts['PASS']}")
+            pdf.canvas.drawString(x + 132, top - 66, f"경고 {counts['WARNING']}")
+            pdf.canvas.drawString(x + 132, top - 84, f"실패 {counts['FAIL']}")
+        else:
+            pdf.canvas.setFont(pdf.bold_font, 28)
+            pdf.canvas.setFillColor(pdf_hex("#ff7a1a"))
+            pdf.canvas.drawCentredString(x + card_w / 2, top - 70, grade)
+            pdf.canvas.setFont(pdf.regular_font, 8)
+            pdf.canvas.setFillColor(pdf_hex("#536276"))
+            pdf.canvas.drawCentredString(x + card_w / 2, top - 92, report_grade_message(grade)[:38])
+    pdf.y = top - 132
+    pdf.heading("해결이 필요한 문제점", 13)
+    for index, item in enumerate(report_top_issues(record, 4), start=1):
+        pdf.ensure_space(28)
+        y = pdf.y
+        pdf.canvas.setFillColor(pdf_hex("#fff7ef"))
+        pdf.canvas.setStrokeColor(pdf_hex("#ffd0b3"))
+        pdf.canvas.roundRect(pdf.margin_x, y - 21, pdf.content_width, 25, 4, fill=1, stroke=1)
+        pdf.canvas.setFont(pdf.bold_font, 9)
+        pdf.canvas.setFillColor(pdf_hex("#ff7a1a"))
+        pdf.canvas.drawString(pdf.margin_x + 10, y - 12, str(index))
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        pdf.canvas.drawString(pdf.margin_x + 32, y - 12, item_name(item)[:70])
+        pdf.canvas.setFillColor(pdf_hex("#ff6b37"))
+        pdf.canvas.drawRightString(pdf.width - pdf.margin_x - 10, y - 12, "즉시 조치 필요")
+        pdf.y -= 30
+
+
+def draw_reportlab_ars(pdf: ReportLabPdf, record: dict, premium: bool) -> None:
+    reportlab_new_page(pdf, premium)
+    score = int(record.get("score") or 0)
+    current = max(1.0, min(10.0, round(score / 10, 1)))
+    after = min(10.0, round(current + len(report_top_issues(record, 6)) * 0.5, 1))
+    pdf.heading("ARS Score - 광고연관지수", 17)
+    top = pdf.y
+    pdf.ensure_space(105)
+    for index, (label, value, color) in enumerate([("현재 ARS Score", current, "#f97316"), ("경고 해결 후 예상 ARS", after, "#22c55e")]):
+        x = pdf.margin_x + index * ((pdf.content_width - 16) / 2 + 16)
+        w = (pdf.content_width - 16) / 2
+        pdf.canvas.setFillColor(pdf_hex("#ffffff"))
+        pdf.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+        pdf.canvas.roundRect(x, top - 80, w, 80, 6, fill=1, stroke=1)
+        pdf.canvas.setFont(pdf.regular_font, 9)
+        pdf.canvas.setFillColor(pdf_hex("#536276"))
+        pdf.canvas.drawCentredString(x + w / 2, top - 25, label)
+        pdf.canvas.setFont(pdf.bold_font, 27)
+        pdf.canvas.setFillColor(pdf_hex(color))
+        pdf.canvas.drawCentredString(x + w / 2, top - 56, f"{value} / 10")
+    pdf.y = top - 105
+    pdf.heading("ARS 산출 근거 카테고리", 13)
+    for label, value, color in readiness_categories(record):
+        pdf.ensure_space(24)
+        y = pdf.y
+        pdf.canvas.setFont(pdf.regular_font, 8)
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        pdf.canvas.drawString(pdf.margin_x, y - 6, label)
+        pdf.canvas.drawRightString(pdf.margin_x + 175, y - 6, f"{value:.1f} / 100")
+        pdf.canvas.setFillColor(pdf_hex("#edf2f7"))
+        pdf.canvas.roundRect(pdf.margin_x + 190, y - 10, pdf.content_width - 190, 7, 3, fill=1, stroke=0)
+        pdf.canvas.setFillColor(pdf_hex(color))
+        pdf.canvas.roundRect(pdf.margin_x + 190, y - 10, (pdf.content_width - 190) * value / 100, 7, 3, fill=1, stroke=0)
+        pdf.y -= 22
+
+
+def draw_reportlab_grouped_results(pdf: ReportLabPdf, record: dict, premium: bool) -> None:
+    reportlab_new_page(pdf, premium)
+    pdf.heading(f"{len(report_items(record))}개 점검 항목 전체 결과", 17)
+    for title, items in report_grouped_items(record):
+        if title == "진단 제외":
+            continue
+        pdf.ensure_space(36)
+        pdf.canvas.setFillColor(pdf_hex("#f4f7fa"))
+        pdf.canvas.roundRect(pdf.margin_x, pdf.y - 22, pdf.content_width, 26, 4, fill=1, stroke=0)
+        pdf.canvas.setFont(pdf.bold_font, 10)
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        pdf.canvas.drawString(pdf.margin_x + 10, pdf.y - 12, f"{title} ({len(items)}개)")
+        pdf.y -= 30
+        for item in items[:12]:
+            pdf.ensure_space(18)
+            pdf.canvas.setFont(pdf.regular_font, 8)
+            pdf.canvas.setFillColor(pdf_hex("#06132a"))
+            pdf.canvas.drawString(pdf.margin_x + 8, pdf.y - 5, item_name(item)[:76])
+            pdf.status_badge(report_text(item.get("status"), ""), pdf.width - pdf.margin_x - 44, pdf.y - 4)
+            pdf.y -= 17
+        pdf.y -= 6
+
+
+def draw_reportlab_glossary_action(pdf: ReportLabPdf, premium: bool) -> None:
+    reportlab_new_page(pdf, premium)
+    pdf.heading("필수 점검 항목 정의", 17)
+    rows = [
+        ("Meta Description", "검색결과 페이지 요약문", "페이지 콘텐츠 파악 가능"),
+        ("title 태그", "검색결과 제목", "광고연관지수 핵심 신호"),
+        ("H1 태그", "본문 최상위 제목", "문서 구조 파악"),
+        ("Alt 속성", "이미지 대체 정보", "이미지 노출 및 접근성"),
+        ("Open Graph", "SNS 공유 메타", "외부 채널 미리보기"),
+        ("Schema.org", "구조화 마크업", "리치 스니펫 클릭률 강화"),
+    ]
+    for name, what, why in rows:
+        pdf.ensure_space(24)
+        pdf.canvas.setFont(pdf.bold_font, 8)
+        pdf.canvas.setFillColor(pdf_hex("#06132a"))
+        pdf.canvas.drawString(pdf.margin_x, pdf.y - 6, name)
+        pdf.canvas.setFont(pdf.regular_font, 8)
+        pdf.canvas.setFillColor(pdf_hex("#536276"))
+        pdf.canvas.drawString(pdf.margin_x + 130, pdf.y - 6, what)
+        pdf.canvas.drawString(pdf.margin_x + 310, pdf.y - 6, why)
+        pdf.y -= 20
+    reportlab_new_page(pdf, premium)
+    pdf.heading("애드부스트 광고 운영 연계 액션플랜", 17)
+    for title, copy in [
+        ("광고 연관지수 개선", "메타 타이틀, 설명, 페이지 핵심 문구를 광고 키워드와 맞춥니다."),
+        ("클릭 기대지수 개선", "소재 이미지와 확장소재의 품질을 개선합니다."),
+        ("운영 활용", "동일 URL 키워드 연결도를 비교하고 저연관 조합을 제외합니다."),
+        ("재진단", "개선 후 동일 URL을 재분석해 등급 및 경고 변화를 추적합니다."),
+    ]:
+        pdf.ensure_space(40)
+        pdf.canvas.setFillColor(pdf_hex("#f8fbfd"))
+        pdf.canvas.setStrokeColor(pdf_hex("#dbe3eb"))
+        pdf.canvas.roundRect(pdf.margin_x, pdf.y - 34, pdf.content_width, 38, 5, fill=1, stroke=1)
+        pdf.text(title, x=pdf.margin_x + 10, size=9, font=pdf.bold_font, max_width=pdf.content_width - 20)
+        pdf.text(copy, x=pdf.margin_x + 10, size=8, color="#536276", max_width=pdf.content_width - 20)
+        pdf.y -= 8
 
 
 def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, platform: str) -> bytes:
@@ -2341,13 +3207,22 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     host = report_host(url)
     grade = report_text(record.get("grade"), "C")
     score = report_text(record.get("score"), "0")
-    created_at = report_text(record.get("createdAt"))
-    snapshot = record.get("renderSnapshot") or {}
+    created_at = report_created_at(record)
+    snapshot = report_render_snapshot(record)
     issue_count = counts["WARNING"] + counts["FAIL"]
 
+    if premium:
+        draw_reportlab_cover(pdf, record, platform)
+
     pdf.header(premium)
-    pdf.heading("진단보고서", 22)
-    pdf.text("이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다.", size=10, color="#536276")
+    pdf.heading("한눈에 보는 진단 결과" if premium else "진단보고서", 22)
+    pdf.text(
+        "프리미엄 리포트는 진단 결과를 광고 운영 관점의 개선 우선순위와 플랫폼 수정 가이드로 재구성합니다."
+        if premium
+        else "이 보고서는 네이버 ADVoost 검색 광고 연결 URL의 검색엔진 친화도를 분석한 결과입니다.",
+        size=10,
+        color="#536276",
+    )
     pdf.text("수집 실패, 색인 실패, SEO 점검 필요 여부를 심층 진단하여 A에서 F까지의 등급을 제공합니다.", size=10, color="#536276")
     pdf.text("진단 도구는 웹사이트에 대한 전반적인 점검 결과를 제공하며 검색 광고 노출을 보장하지는 않습니다.", size=10, font=pdf.bold_font, color="#f00000")
     pdf.y -= 8
@@ -2366,7 +3241,7 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     pdf.canvas.drawCentredString(center_x, center_y - 11, grade)
     pdf.canvas.setLineWidth(1)
     pdf.draw_image_frame(
-        snapshot.get("desktopScreenshot"),
+        report_get(snapshot, "desktopScreenshot", "desktop_screenshot"),
         pdf.margin_x + 240,
         overview_top - 2,
         210,
@@ -2374,7 +3249,7 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
         "데스크톱",
     )
     pdf.draw_image_frame(
-        snapshot.get("mobileScreenshot"),
+        report_get(snapshot, "mobileScreenshot", "mobile_screenshot"),
         pdf.margin_x + 462,
         overview_top - 2,
         58,
@@ -2393,11 +3268,40 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
     pdf.count_cards(counts)
 
     if premium:
-        pdf.canvas.showPage()
-        pdf.y = pdf.height - pdf.margin_top
-        pdf.header(premium)
+        reportlab_new_page(pdf, premium)
+        draw_reportlab_summary(pdf, record, premium)
+        draw_reportlab_ars(pdf, record, premium)
+        draw_reportlab_grouped_results(pdf, record, premium)
+
+        reportlab_new_page(pdf, premium)
+        pdf.heading("키워드 요약", 17)
+        summary = report_keyword_summary(record)
+        draw_keyword_rows(pdf, summary.get("singleRows") or [], "개별 키워드")
+        draw_keyword_rows(pdf, summary.get("phraseRows") or [], "구문(Phrase) 키워드")
+
+        reportlab_new_page(pdf, premium)
+        pdf.heading("페이지 키워드 - 메타태그 매칭 분석", 17)
+        rows = (summary.get("singleRows") or [])[:10]
+        if not rows:
+            pdf.text("키워드 데이터가 없습니다.", size=9, color="#6b7685")
+        else:
+            missing = sum(1 for row in rows if not keyword_title_ok(row) or not keyword_desc_ok(row))
+            pdf.text(f"고빈도 키워드 중 {missing}개가 title 또는 meta description에 충분히 반영되지 않았습니다.", size=9, color="#d65a00")
+            draw_keyword_rows(pdf, rows, "키워드 - 메타 정보 매칭 현황")
+
+        reportlab_new_page(pdf, premium)
+        pdf.heading("전체 점검 세부 내역", 17)
+        for title_text, items in report_grouped_items(record):
+            pdf.ensure_space(32)
+            pdf.text(title_text, size=11, font=pdf.bold_font, color="#06132a")
+            for item in sorted(items, key=lambda value: (REPORT_STATUS_SORT.get(report_text(value.get("status"), ""), 9), item_name(value))):
+                pdf.item_block(item, premium=True)
+
+        reportlab_new_page(pdf, premium)
         pdf.heading("프리미엄 플랫폼 수정 가이드", 17)
         pdf.text(f"선택 플랫폼: {platform}", size=10, font=pdf.bold_font)
+        for item in report_top_issues(record, 4):
+            pdf.item_block(item, premium=False)
         for guide_title, copy in platform_guide(platform):
             pdf.ensure_space(42)
             pdf.canvas.setFillColor(pdf_hex("#f8fbfd"))
@@ -2407,25 +3311,30 @@ def render_report_pdf_with_reportlab(record: dict, report_type: ReportType, plat
             pdf.text(copy, x=pdf.margin_x + 10, size=8, color="#536276", max_width=pdf.content_width - 20)
             pdf.y -= 8
 
-        summary = record.get("keywordSummary") or {}
-        pdf.canvas.showPage()
-        pdf.y = pdf.height - pdf.margin_top
-        pdf.header(premium)
+        draw_reportlab_glossary_action(pdf, premium)
+        reportlab_new_page(pdf, premium)
+        pdf.heading("부록 (Appendix & References)", 17)
+        pdf.text("SEO, SERP, CTR, CPC, ROAS, OG, JSON-LD, Schema.org 등 주요 용어를 내부 광고 운영 기준과 함께 해석합니다.", size=9, color="#536276")
+        pdf.y -= 120
+        pdf.heading("지금 개선하면, 광고 효율이 달라집니다.", 16)
+        pdf.text("문의: mc2@nasmedia.co.kr", size=10, color="#536276")
+    else:
+        summary = report_keyword_summary(record)
+        reportlab_new_page(pdf, premium)
         pdf.heading("키워드 요약", 17)
         draw_keyword_rows(pdf, summary.get("singleRows") or [], "개별 키워드")
-        draw_keyword_rows(pdf, summary.get("phraseRows") or [], "프레이즈 키워드")
-        items = record.get("items", [])
-    else:
-        items = [item for item in record.get("items", []) if report_text(item.get("status")) != "PASS"]
+        draw_keyword_rows(pdf, summary.get("phraseRows") or [], "구문(Phrase) 키워드")
 
-    pdf.canvas.showPage()
-    pdf.y = pdf.height - pdf.margin_top
-    pdf.header(premium)
-    pdf.heading("점검 세부 내역" if premium else "개선 필요 항목", 17)
-    if not items:
-        pdf.text("개선이 필요한 항목이 없습니다.", size=10, color="#536276")
-    for item in items:
-        pdf.item_block(item, premium=premium)
+        reportlab_new_page(pdf, premium)
+        pdf.heading("전체 점검 세부 내역", 17)
+        items = report_items(record)
+        if not items:
+            pdf.text("점검 항목이 없습니다.", size=10, color="#536276")
+        for title_text, grouped in report_grouped_items(record):
+            pdf.ensure_space(32)
+            pdf.text(title_text, size=11, font=pdf.bold_font, color="#06132a")
+            for item in sorted(grouped, key=lambda value: (REPORT_STATUS_SORT.get(report_text(value.get("status"), ""), 9), item_name(value))):
+                pdf.item_block(item, premium=False)
 
     return pdf.finish()
 
