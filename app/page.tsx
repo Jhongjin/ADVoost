@@ -243,6 +243,17 @@ async function requestAuditDirect(recordInput: {
   return apiResponseToRecord(body);
 }
 
+async function requestHistoryRecords() {
+  const response = await fetch(`${API_BASE_URL}/api/history?user_id=internal-platform`);
+
+  if (!response.ok) {
+    throw new Error(`History API failed: ${response.status}`);
+  }
+
+  const body = (await response.json()) as ApiAuditResponse[];
+  return body.map(apiResponseToRecord);
+}
+
 async function requestAudit(recordInput: {
   url: string;
   managerName: string;
@@ -401,6 +412,27 @@ export default function Home() {
 
   useEffect(() => {
     setActiveView(getInitialView());
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadHistory() {
+      try {
+        const historyRecords = await requestHistoryRecords();
+        if (!cancelled && historyRecords.length > 0) {
+          setRecords(historyRecords);
+          setDetailRecord(historyRecords[0]);
+        }
+      } catch {
+        // Keep the bundled demo data available when the backend is sleeping or empty.
+      }
+    }
+
+    void loadHistory();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const dashboardStats = useMemo(() => {

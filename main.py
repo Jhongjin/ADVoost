@@ -1663,6 +1663,109 @@ def report_render_snapshot(record: dict) -> dict:
     return snapshot if isinstance(snapshot, dict) else {}
 
 
+def report_has_render_images(record: dict) -> bool:
+    snapshot = report_render_snapshot(record)
+    for key in ("desktopScreenshot", "desktop_screenshot", "mobileScreenshot", "mobile_screenshot"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if value:
+            return True
+    return False
+
+
+def report_needs_history_payload(record: dict) -> bool:
+    return not report_items(record) or not report_keyword_summary(record) or not report_has_render_images(record)
+
+
+def load_report_history_payload(record: dict) -> dict | None:
+    record_id = str(record.get("id") or "").strip()
+    raw_url = str(record.get("url") or "").strip()
+    user_id = str(record.get("userId") or record.get("user_id") or "internal-platform").strip()
+    normalized_url = normalize_url(raw_url) if raw_url else ""
+    require_images = not report_has_render_images(record)
+    fallback_payload: dict | None = None
+
+    def choose_payload(rows) -> dict | None:
+        nonlocal fallback_payload
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if fallback_payload is None:
+                fallback_payload = payload
+            if not require_images or report_has_render_images(payload):
+                return payload
+        return None
+
+    with db() as conn:
+        if record_id:
+            rows = conn.execute(
+                """
+                SELECT payload
+                FROM audit_history
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (record_id,),
+            ).fetchall()
+            payload = choose_payload(rows)
+            if payload is not None:
+                return payload
+
+        if normalized_url and user_id:
+            rows = conn.execute(
+                """
+                SELECT payload
+                FROM audit_history
+                WHERE user_id = ? AND url = ?
+                ORDER BY
+                    CASE
+                        WHEN payload LIKE '%desktop_screenshot%' AND payload LIKE '%mobile_screenshot%' THEN 0
+                        ELSE 1
+                    END,
+                    created_at DESC
+                LIMIT 8
+                """,
+                (user_id, normalized_url),
+            ).fetchall()
+            payload = choose_payload(rows)
+            if payload is not None:
+                return payload
+
+        if normalized_url:
+            rows = conn.execute(
+                """
+                SELECT payload
+                FROM audit_history
+                WHERE url = ?
+                ORDER BY
+                    CASE
+                        WHEN payload LIKE '%desktop_screenshot%' AND payload LIKE '%mobile_screenshot%' THEN 0
+                        ELSE 1
+                    END,
+                    created_at DESC
+                LIMIT 8
+                """,
+                (normalized_url,),
+            ).fetchall()
+            payload = choose_payload(rows)
+            if payload is not None:
+                return payload
+
+    return fallback_payload
+
+
+def hydrate_report_records(records: list[dict]) -> list[dict]:
+    hydrated: list[dict] = []
+    for record in records:
+        if report_needs_history_payload(record):
+            history_payload = load_report_history_payload(record)
+            if history_payload is not None:
+                hydrated.append(history_payload)
+                continue
+        hydrated.append(record)
+    return hydrated
+
+
 def item_name(item: dict) -> str:
     return report_text(report_get(item, "itemName", "item_name"))
 
@@ -2058,7 +2161,25 @@ def premium_keyword_match_html(record: dict) -> str:
         f"<span style='font-size:{18 + min(22, int(row.get('frequency') or 1) * 3)}px; transform:rotate({(-18 + index * 7) % 34 - 17}deg)'>{escape(report_text(row.get('keyword')))}</span>"
         for index, row in enumerate(rows)
     )
-    table = keyword_table_html(record, "singleRows", "키워드 - 메타 정보 매칭 현황", 10)
+    table_rows = []
+    for index, row in enumerate(rows, start=1):
+        title_ok = keyword_title_ok(row)
+        desc_ok = keyword_desc_ok(row)
+        table_rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><strong>{escape(report_text(row.get('keyword')))}</strong></td>"
+            f"<td>{escape(report_text(row.get('frequency')))}</td>"
+            f"<td class='mark {'ok' if title_ok else 'no'}'>{'O' if title_ok else 'X'}</td>"
+            f"<td class='mark {'ok' if desc_ok else 'no'}'>{'O' if desc_ok else 'X'}</td>"
+            "</tr>"
+        )
+    table = (
+        "<h3>키워드 - 메타 정보 매칭 현황</h3>"
+        "<table class='match-table'><thead><tr><th>#</th><th>키워드</th><th>빈도</th><th>title</th><th>meta</th></tr></thead>"
+        f"<tbody>{''.join(table_rows)}</tbody></table>"
+        f"<p class='table-note'>상위 {len(rows)}개 표시 (전체 {escape(report_text(report_keyword_summary(record).get('singleTotal') or report_keyword_summary(record).get('single_total') or len(rows)))}개)</p>"
+    )
     missing = sum(1 for row in rows if not keyword_title_ok(row) or not keyword_desc_ok(row))
     return f"""
     <section class="page-break keyword-match">
@@ -2218,7 +2339,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
   <meta charset="utf-8" />
   <style>
     {report_font_face_css()}
-    @page {{ size: A4; margin: 17mm 15mm; }}
+    @page {{ size: A4; margin: 14mm 12mm; }}
+    html {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
@@ -2229,7 +2351,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       line-height: 1.58;
     }}
     section {{ margin-bottom: 20px; }}
-    .page-break {{ break-before: page; }}
+    .page-break {{ break-before: page; page-break-before: always; }}
+    h1, h2, h3, .brand, .section-title, thead {{ break-after: avoid; page-break-after: avoid; }}
     .eyebrow {{
       margin: 0 0 8px;
       color: #7a8797;
@@ -2299,7 +2422,7 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     }}
     .desktop {{ height: 190px; border-radius: 8px; }}
     .mobile {{ height: 170px; border-radius: 24px; }}
-    .desktop img, .mobile img {{ width: 100%; height: 100%; object-fit: cover; object-position: top; }}
+    .desktop img, .mobile img {{ width: 100%; height: 100%; object-fit: contain; object-position: top; background: #fff; }}
     .counts {{
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -2319,12 +2442,16 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .fail strong {{ color: #e40046; }}
     .skip strong {{ color: #a50041; }}
     table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    thead {{ display: table-header-group; }}
+    tfoot {{ display: table-footer-group; }}
+    tr, th, td {{ break-inside: avoid; page-break-inside: avoid; }}
     th, td {{
       padding: 9px 10px;
       border-top: 1px solid #e2e8f0;
       vertical-align: top;
       text-align: left;
-      word-break: break-word;
+      overflow-wrap: anywhere;
+      word-break: keep-all;
     }}
     th {{ color: #536276; background: #f4f7fa; font-weight: 700; }}
     td small {{ display: block; margin-top: 2px; color: #7b8795; }}
@@ -2334,6 +2461,11 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .keyword-table th:nth-child(5), .keyword-table td:nth-child(5) {{ width: 70px; }}
     .keyword-table th:nth-child(6), .keyword-table td:nth-child(6),
     .keyword-table th:nth-child(7), .keyword-table td:nth-child(7) {{ width: 92px; text-align: center; }}
+    .match-table th:nth-child(1), .match-table td:nth-child(1) {{ width: 38px; text-align: center; }}
+    .match-table th:nth-child(2), .match-table td:nth-child(2) {{ width: auto; word-break: keep-all; }}
+    .match-table th:nth-child(3), .match-table td:nth-child(3) {{ width: 54px; text-align: right; }}
+    .match-table th:nth-child(4), .match-table td:nth-child(4),
+    .match-table th:nth-child(5), .match-table td:nth-child(5) {{ width: 58px; text-align: center; }}
     .bar-cell {{ width: 100%; height: 8px; border-radius: 99px; background: #e8eef3; overflow: hidden; }}
     .bar-cell span {{ display: block; height: 100%; border-radius: inherit; background: #10c98b; }}
     .mark {{ font-weight: 800; }}
@@ -2352,8 +2484,12 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .status-fail {{ color: #d20b3f; background: #ffe9ed; }}
     .status-not-checked {{ color: #536276; background: #edf2f7; }}
     pre {{
+      overflow: visible;
       overflow-wrap: anywhere;
+      word-break: break-all;
       white-space: pre-wrap;
+      break-inside: auto;
+      page-break-inside: auto;
       margin: 0;
       padding: 10px;
       border-radius: 8px;
@@ -2376,7 +2512,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .section-title h2 {{ margin: 0; }}
     .section-title span {{ color: #00945f; font-weight: 700; }}
     .issue-item {{
-      break-inside: avoid;
+      break-inside: auto;
+      page-break-inside: auto;
       padding: 14px 18px;
       border: 1px solid #dbe3eb;
       border-top: 0;
@@ -2384,6 +2521,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     }}
     .issue-item:last-child {{ border-radius: 0 0 8px 8px; }}
     .issue-head {{
+      break-inside: avoid;
+      page-break-inside: avoid;
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(180px, 42%);
       gap: 14px;
@@ -2416,6 +2555,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
       text-align: right;
     }}
     .finding-copy {{
+      break-inside: avoid;
+      page-break-inside: avoid;
       margin: 0 0 10px 24px;
       padding: 9px 12px;
       border-radius: 7px;
@@ -2437,7 +2578,7 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     .premium-cover {{
       position: relative;
       min-height: 260mm;
-      margin: -17mm -15mm 0;
+      margin: -14mm -12mm 0;
       padding: 24mm 20mm;
       color: #fff;
       background: #1b2e4d;
@@ -2490,6 +2631,8 @@ def build_report_html(record: dict, report_type: ReportType, platform: str) -> s
     }}
     .summary-grid {{ grid-template-columns: 1fr 1fr; }}
     .summary-card, .meter-card, .platform-grid aside, .action-card, .method-box, .alert-box, .contact-card {{
+      break-inside: avoid;
+      page-break-inside: avoid;
       border: 1px solid #dbe3eb;
       border-radius: 8px;
       background: #fff;
@@ -2681,6 +2824,42 @@ REPORTLAB_FALLBACK_REGULAR = "Helvetica"
 REPORTLAB_FALLBACK_BOLD = "Helvetica-Bold"
 
 
+def wait_for_report_assets(page) -> None:
+    page.emulate_media(media="print")
+    try:
+        page.wait_for_function(
+            "() => !document.fonts || document.fonts.status === 'loaded'",
+            timeout=10000,
+        )
+    except Exception:
+        pass
+    page.evaluate(
+        """
+        async () => {
+          const images = Array.from(document.images || []);
+          await Promise.all(images.map((img) => {
+            if (img.complete && img.naturalWidth > 0) {
+              return Promise.resolve();
+            }
+            return new Promise((resolve) => {
+              const done = () => resolve();
+              img.addEventListener('load', done, { once: true });
+              img.addEventListener('error', done, { once: true });
+              setTimeout(done, 5000);
+            });
+          }));
+          await Promise.all(images.map((img) => {
+            if (img.decode) {
+              return img.decode().catch(() => undefined);
+            }
+            return Promise.resolve();
+          }));
+        }
+        """
+    )
+    page.wait_for_timeout(200)
+
+
 def render_report_pdfs_with_browser(
     records: list[dict],
     report_type: ReportType,
@@ -2696,22 +2875,24 @@ def render_report_pdfs_with_browser(
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--single-process",
             ],
         )
         try:
             for record in records:
                 page = browser.new_page(viewport={"width": 1240, "height": 1754})
+                page.set_default_timeout(30000)
                 try:
                     page.set_content(
                         build_report_html(record, report_type, platform),
                         wait_until="load",
                         timeout=20000,
                     )
+                    wait_for_report_assets(page)
                     pdf = page.pdf(
                         format="A4",
                         print_background=True,
-                        margin={"top": "14mm", "right": "12mm", "bottom": "14mm", "left": "12mm"},
+                        prefer_css_page_size=True,
+                        margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
                     )
                 finally:
                     page.close()
@@ -3353,15 +3534,16 @@ def render_report_pdfs_with_reportlab(
 
 
 def render_report_pdfs(records: list[dict], report_type: ReportType, platform: str) -> list[tuple[str, bytes]]:
+    hydrated_records = hydrate_report_records(records)
     browser_error: Exception | None = None
     if sync_playwright is not None:
         try:
-            return render_report_pdfs_with_browser(records, report_type, platform)
+            return render_report_pdfs_with_browser(hydrated_records, report_type, platform)
         except Exception as exc:
             browser_error = exc
 
     try:
-        return render_report_pdfs_with_reportlab(records, report_type, platform)
+        return render_report_pdfs_with_reportlab(hydrated_records, report_type, platform)
     except Exception as fallback_error:
         detail = "PDF renderer failed."
         if browser_error is not None:
