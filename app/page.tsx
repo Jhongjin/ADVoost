@@ -58,6 +58,7 @@ type ToastState = {
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_AUDIT_API_URL ?? "http://localhost:8000";
+const UNLIMITED_CREDITS = "∞";
 
 const navItems: Array<{
   key: ViewKey;
@@ -107,7 +108,7 @@ function CreditPill() {
   return (
     <span className="credit-pill" title="원본 UI와 동일한 표시용 배지입니다">
       <Coins size={15} />
-      <strong>9949</strong>
+      <strong>{UNLIMITED_CREDITS}</strong>
       <span>크레딧</span>
     </span>
   );
@@ -1093,7 +1094,7 @@ export default function Home() {
           <div className="summary-strip">
             <div className="summary-cell active">
               <span>사용 가능한 크레딧</span>
-              <strong>9,949</strong>
+              <strong>{UNLIMITED_CREDITS}</strong>
             </div>
             <div className="summary-cell">
               <span>소진한 크레딧</span>
@@ -1191,7 +1192,7 @@ export default function Home() {
         <div className="sidebar-credit">
           <Coins size={15} />
           <span>크레딧</span>
-          <strong>9949</strong>
+          <strong>{UNLIMITED_CREDITS}</strong>
         </div>
         <nav>
           <button
